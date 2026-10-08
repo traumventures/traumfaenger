@@ -1,7 +1,7 @@
 {
-    "name": "@traumwohnung/ai-ledger-client",
+    "name": "@traumfaenger/client",
     "version": "0.1.0",
-    "description": "Records AI provider traffic (fetch, SSE, WebSocket) and streams it to ai-ledger; typed query client.",
+    "description": "Records AI provider traffic (fetch, SSE, WebSocket) and streams it to traumfaenger; typed query client.",
     "license": "UNLICENSED",
     "type": "module",
     "sideEffects": false,
@@ -11,6 +11,6 @@
     "files": ["src"],
     "dependencies": {
         "@msgpack/msgpack": "^3.1.3",
-        "@traumwohnung/ai-ledger-api": "workspace:*"
+        "@traumfaenger/api": "workspace:*"
     }
 }

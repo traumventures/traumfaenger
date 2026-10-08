@@ -21,14 +21,14 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use ai_ledger_api::{
-    Dimension, Direction, EndReason, Exchange, ExchangeEnd, Frame, ListQuery, ListResponse, LogEntry, StoredExchange,
-    SummaryQuery, SummaryResponse, SummaryRow, Transport, limits,
-};
 use chrono::{DateTime, Utc};
 use duckdb::{
     Connection, Row, appender_params_from_iter, params_from_iter,
     types::{TimeUnit, Value},
+};
+use traumfaenger_api::{
+    Dimension, Direction, EndReason, Exchange, ExchangeEnd, Frame, ListQuery, ListResponse, LogEntry, StoredExchange,
+    SummaryQuery, SummaryResponse, SummaryRow, Transport, limits,
 };
 
 /// Ordered schema migrations. Append only once released; nothing is deployed yet.
@@ -40,7 +40,6 @@ const MIGRATIONS: &[&str] = &["CREATE SEQUENCE raw_seq START 1;
         is_final BOOLEAN NOT NULL,
         received_at TIMESTAMP NOT NULL,
         service VARCHAR NOT NULL,
-        environment VARCHAR NOT NULL,
         operation VARCHAR NOT NULL,
         session_id VARCHAR,
         metadata VARCHAR NOT NULL,
@@ -70,12 +69,12 @@ const MIGRATIONS: &[&str] = &["CREATE SEQUENCE raw_seq START 1;
     )"];
 
 /// Columns written on ingestion, in this order. `seq` takes its default.
-const INSERT_COLUMNS: &str = "id, segment, is_final, received_at, service, environment, operation, session_id, \
+const INSERT_COLUMNS: &str = "id, segment, is_final, received_at, service, operation, session_id, \
      metadata, transport, url, started_at, status, end_at_ms, end_reason, end_error, close_code, truncated, \
      frame_count, bytes";
 
 /// Log entry columns. Timestamps are exchanged as epoch microseconds.
-const ENTRY_COLUMNS: &str = "seq, id, segment, is_final, epoch_us(received_at), service, environment, operation, \
+const ENTRY_COLUMNS: &str = "seq, id, segment, is_final, epoch_us(received_at), service, operation, \
      session_id, metadata, transport, url, epoch_us(started_at), status, end_at_ms, end_reason, end_error, \
      close_code, truncated, frame_count, bytes";
 
@@ -244,7 +243,6 @@ impl Store {
         Ok(Some(StoredExchange {
             id: first.id.clone(),
             service: first.service.clone(),
-            environment: first.environment.clone(),
             operation: first.operation.clone(),
             session_id: first.session_id.clone(),
             metadata: first.metadata.clone(),
@@ -394,9 +392,9 @@ fn lock(mutex: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
 }
 
 fn migrate(connection: &Connection) -> Result<(), StoreError> {
-    connection.execute_batch("CREATE TABLE IF NOT EXISTS ai_ledger_migrations (version INTEGER PRIMARY KEY)")?;
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS traumfaenger_migrations (version INTEGER PRIMARY KEY)")?;
     let applied: i64 =
-        connection.query_row("SELECT coalesce(max(version), 0) FROM ai_ledger_migrations", [], |row| row.get(0))?;
+        connection.query_row("SELECT coalesce(max(version), 0) FROM traumfaenger_migrations", [], |row| row.get(0))?;
     let applied = usize::try_from(applied).unwrap_or(usize::MAX);
     if applied > MIGRATIONS.len() {
         return Err(StoreError::Corrupt(format!(
@@ -406,7 +404,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     }
     for (index, sql) in MIGRATIONS.iter().enumerate().skip(applied) {
         connection.execute_batch(&format!(
-            "BEGIN TRANSACTION; {sql}; INSERT INTO ai_ledger_migrations VALUES ({}); COMMIT;",
+            "BEGIN TRANSACTION; {sql}; INSERT INTO traumfaenger_migrations VALUES ({}); COMMIT;",
             index + 1
         ))?;
     }
@@ -426,7 +424,7 @@ fn is_size(value: &str) -> bool {
 /// The filter fields shared by list and summary queries.
 struct Filters<'a> {
     /// Column name and value. Column names are fixed here, never from a request.
-    text: [(&'static str, Option<&'a str>); 5],
+    text: [(&'static str, Option<&'a str>); 4],
     failed: Option<bool>,
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
@@ -437,7 +435,6 @@ macro_rules! filters_from {
         Filters {
             text: [
                 ("service", $query.service.as_deref()),
-                ("environment", $query.environment.as_deref()),
                 ("operation", $query.operation.as_deref()),
                 ("session_id", $query.session_id.as_deref()),
                 ("transport", $query.transport.map(Transport::as_str)),
@@ -493,7 +490,6 @@ impl Filter {
 fn dimension_sql(dimension: Dimension) -> &'static str {
     match dimension {
         Dimension::Service => "service",
-        Dimension::Environment => "environment",
         Dimension::Operation => "operation",
         Dimension::SessionId => "session_id",
         Dimension::Transport => "transport",
@@ -527,7 +523,7 @@ fn parse_direction(value: &str) -> Result<Direction, StoreError> {
 }
 
 /// Column values of one record, in [`INSERT_COLUMNS`] order.
-fn row_values(record: &Exchange, received_at: DateTime<Utc>) -> [Value; 20] {
+fn row_values(record: &Exchange, received_at: DateTime<Utc>) -> [Value; 19] {
     let metadata = serde_json::to_string(&record.metadata.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".into());
     let end = record.end.as_ref();
     [
@@ -536,7 +532,6 @@ fn row_values(record: &Exchange, received_at: DateTime<Utc>) -> [Value; 20] {
         Value::Boolean(record.is_final),
         timestamp(received_at),
         text(&record.service),
-        text(&record.environment),
         text(&record.operation),
         optional_text(record.session_id.as_deref()),
         Value::Text(metadata),
@@ -586,17 +581,17 @@ fn read_entry(row: &Row<'_>) -> Result<LogEntry, StoreError> {
         DateTime::from_timestamp_micros(micros).ok_or_else(|| StoreError::Corrupt(format!("timestamp {micros}")))
     };
     let segment: i32 = row.get(2)?;
-    let metadata: String = row.get(9)?;
-    let transport: String = row.get(10)?;
-    let end_at_ms: Option<i64> = row.get(14)?;
-    let end_reason: Option<String> = row.get(15)?;
-    let frame_count: i32 = row.get(19)?;
+    let metadata: String = row.get(8)?;
+    let transport: String = row.get(9)?;
+    let end_at_ms: Option<i64> = row.get(13)?;
+    let end_reason: Option<String> = row.get(14)?;
+    let frame_count: i32 = row.get(18)?;
     let end = match (end_at_ms, end_reason) {
         (Some(at_ms), Some(reason)) => Some(ExchangeEnd {
             at_ms: u64::try_from(at_ms).map_err(|_| StoreError::Corrupt(format!("end_at_ms {at_ms}")))?,
             reason: EndReason::parse(&reason).ok_or_else(|| StoreError::Corrupt(format!("end_reason `{reason}`")))?,
-            error: row.get(16)?,
-            close_code: small(row.get(17)?, "close_code")?,
+            error: row.get(15)?,
+            close_code: small(row.get(16)?, "close_code")?,
         }),
         _ => None,
     };
@@ -607,19 +602,18 @@ fn read_entry(row: &Row<'_>) -> Result<LogEntry, StoreError> {
         is_final: row.get(3)?,
         received_at: timestamp(4)?,
         service: row.get(5)?,
-        environment: row.get(6)?,
-        operation: row.get(7)?,
-        session_id: row.get(8)?,
+        operation: row.get(6)?,
+        session_id: row.get(7)?,
         metadata: serde_json::from_str(&metadata).map_err(|_| StoreError::Corrupt("metadata".into()))?,
         transport: Transport::parse(&transport)
             .ok_or_else(|| StoreError::Corrupt(format!("transport `{transport}`")))?,
-        url: row.get(11)?,
-        started_at: timestamp(12)?,
-        status: small(row.get(13)?, "status")?,
+        url: row.get(10)?,
+        started_at: timestamp(11)?,
+        status: small(row.get(12)?, "status")?,
         end,
-        truncated: row.get(18)?,
+        truncated: row.get(17)?,
         frame_count: u32::try_from(frame_count).map_err(|_| StoreError::Corrupt(format!("frames {frame_count}")))?,
-        bytes: unsigned(row, 20)?,
+        bytes: unsigned(row, 19)?,
     })
 }
 
@@ -639,7 +633,6 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "id": id,
             "service": "web",
-            "environment": "production",
             "operation": operation,
             "session_id": "s1",
             "metadata": { "listing_id": "123" },
@@ -660,7 +653,7 @@ mod tests {
     fn ws_segment(id: &str, segment: u32, is_final: bool, data: &str) -> Exchange {
         let mut record = exchange(id, "2026-10-08T10:00:00Z", "voice.interview");
         record.transport = Transport::Ws;
-        record.url = "wss://api.deepslate.example/v1/realtime".into();
+        record.url = "wss://api.voice.example/v1/realtime".into();
         record.status = Some(101);
         record.segment = segment;
         record.is_final = is_final;
@@ -873,9 +866,9 @@ mod tests {
 
     #[test]
     fn reopening_a_file_keeps_data_and_seq_keeps_increasing() {
-        let dir = std::env::temp_dir().join(format!("ai-ledger-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("traumfaenger-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("ledger.duckdb");
+        let path = dir.join("database.duckdb");
         let path = path.to_str().unwrap();
         {
             let store = Store::open(path, Some("256MB")).unwrap();

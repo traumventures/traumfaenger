@@ -8,11 +8,11 @@ import type {
     StoredExchange,
     SummaryQuery,
     SummaryResponse,
-} from "@traumwohnung/ai-ledger-api";
-import { ROUTES } from "@traumwohnung/ai-ledger-api";
+} from "@traumfaenger/api";
+import { ROUTES } from "@traumfaenger/api";
 
 export interface ClientOptions {
-    /** Base URL of the query listener, for example `http://ai-ledger:7601`. */
+    /** Base URL of the query listener, for example `http://traumfaenger:7601`. */
     baseUrl: string;
     /** Bearer token of the query API. Omit only when the server runs with auth disabled. */
     token?: string;
@@ -23,13 +23,13 @@ export interface ClientOptions {
 }
 
 /** A non-2xx response, or a request that never got one (`code` is `network`). */
-export class AiLedgerError extends Error {
+export class TraumfaengerError extends Error {
     readonly status: number;
     readonly code: ErrorCode | "network";
 
     constructor(status: number, code: ErrorCode | "network", message: string, options?: ErrorOptions) {
         super(message, options);
-        this.name = "AiLedgerError";
+        this.name = "TraumfaengerError";
         this.status = status;
         this.code = code;
     }
@@ -69,7 +69,7 @@ export class QueryClient {
         try {
             return await this.#get(ROUTES.getExchange.replace("{id}", encodeURIComponent(id)));
         } catch (error) {
-            if (error instanceof AiLedgerError && error.code === "not_found") return null;
+            if (error instanceof TraumfaengerError && error.code === "not_found") return null;
             throw error;
         }
     }
@@ -93,7 +93,7 @@ export class QueryClient {
                 signal: AbortSignal.timeout(this.#timeoutMs),
             });
         } catch (cause) {
-            throw new AiLedgerError(0, "network", `ai-ledger GET ${path} failed: ${String(cause)}`, { cause });
+            throw new TraumfaengerError(0, "network", `traumfaenger GET ${path} failed: ${String(cause)}`, { cause });
         }
         if (response.ok) return (await response.json()) as T;
         const text = await response.text();
@@ -101,12 +101,12 @@ export class QueryClient {
         try {
             error = JSON.parse(text) as ApiError;
         } catch {
-            // Not an ai-ledger error body, for example from a proxy in front of it.
+            // Not an traumfaenger error body, for example from a proxy in front of it.
         }
-        throw new AiLedgerError(
+        throw new TraumfaengerError(
             response.status,
             error?.error ?? (response.status >= 500 ? "internal" : "invalid_request"),
-            error?.message ?? `ai-ledger GET ${path} returned ${response.status}: ${text.slice(0, 200)}`
+            error?.message ?? `traumfaenger GET ${path} returned ${response.status}: ${text.slice(0, 200)}`
         );
     }
 }

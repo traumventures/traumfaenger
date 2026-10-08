@@ -1,6 +1,6 @@
 [package]
-name = "ai-ledger-api"
-description = "Wire contract of the ai-ledger service: request/response types, routes and limits."
+name = "traumfaenger-api"
+description = "Wire contract of the traumfaenger service: request/response types, routes and limits."
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true

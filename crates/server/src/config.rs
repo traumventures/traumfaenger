@@ -41,14 +41,14 @@ impl Config {
             let value = lookup(name).unwrap_or_else(|| default.to_owned());
             value.parse().map_err(|_| ConfigError(format!("{name} must be host:port, got `{value}`")))
         };
-        let ingest_addr = addr("AI_LEDGER_INGEST_ADDR", "127.0.0.1:7600")?;
-        let query_addr = addr("AI_LEDGER_QUERY_ADDR", "127.0.0.1:7601")?;
+        let ingest_addr = addr("TRAUMFAENGER_INGEST_ADDR", "127.0.0.1:7600")?;
+        let query_addr = addr("TRAUMFAENGER_QUERY_ADDR", "127.0.0.1:7601")?;
 
-        let auth_disabled = match lookup("AI_LEDGER_AUTH").as_deref() {
+        let auth_disabled = match lookup("TRAUMFAENGER_AUTH").as_deref() {
             None | Some("required") => false,
             Some("disabled") => true,
             Some(other) => {
-                return Err(ConfigError(format!("AI_LEDGER_AUTH must be `required` or `disabled`, got `{other}`")));
+                return Err(ConfigError(format!("TRAUMFAENGER_AUTH must be `required` or `disabled`, got `{other}`")));
             }
         };
         let (ingest_token, query_token) = if auth_disabled {
@@ -56,31 +56,31 @@ impl Config {
         } else {
             let token = |name: &str| -> Result<String, ConfigError> {
                 let value = lookup(name).ok_or_else(|| {
-                    ConfigError(format!("{name} is required (or set AI_LEDGER_AUTH=disabled for local use)"))
+                    ConfigError(format!("{name} is required (or set TRAUMFAENGER_AUTH=disabled for local use)"))
                 })?;
                 if value.len() < MIN_TOKEN_LEN {
                     return Err(ConfigError(format!("{name} must be at least {MIN_TOKEN_LEN} characters")));
                 }
                 Ok(value)
             };
-            let ingest = token("AI_LEDGER_INGEST_TOKEN")?;
-            let query = token("AI_LEDGER_QUERY_TOKEN")?;
+            let ingest = token("TRAUMFAENGER_INGEST_TOKEN")?;
+            let query = token("TRAUMFAENGER_QUERY_TOKEN")?;
             if ingest == query {
                 return Err(ConfigError(
-                    "AI_LEDGER_INGEST_TOKEN and AI_LEDGER_QUERY_TOKEN must differ: writers must not be able to read"
+                    "TRAUMFAENGER_INGEST_TOKEN and TRAUMFAENGER_QUERY_TOKEN must differ: writers must not be able to read"
                         .into(),
                 ));
             }
             (Some(ingest), Some(query))
         };
 
-        let retention_days = match lookup("AI_LEDGER_RETENTION_DAYS") {
+        let retention_days = match lookup("TRAUMFAENGER_RETENTION_DAYS") {
             None => None,
             Some(value) => match value.parse::<u32>() {
                 Ok(days) if days > 0 => Some(days),
                 _ => {
                     return Err(ConfigError(format!(
-                        "AI_LEDGER_RETENTION_DAYS must be a positive number of days, got `{value}`"
+                        "TRAUMFAENGER_RETENTION_DAYS must be a positive number of days, got `{value}`"
                     )));
                 }
             },
@@ -88,8 +88,8 @@ impl Config {
 
         Ok(Self {
             retention_days,
-            database: lookup("AI_LEDGER_DATABASE").unwrap_or_else(|| "ai-ledger.duckdb".to_owned()),
-            memory_limit: lookup("AI_LEDGER_MEMORY_LIMIT"),
+            database: lookup("TRAUMFAENGER_DATABASE").unwrap_or_else(|| "traumfaenger.duckdb".to_owned()),
+            memory_limit: lookup("TRAUMFAENGER_MEMORY_LIMIT"),
             ingest_addr,
             query_addr,
             ingest_token,
@@ -112,29 +112,29 @@ mod tests {
     #[test]
     fn requires_two_distinct_tokens_unless_auth_is_disabled() {
         assert!(config(&[]).is_err());
-        assert!(config(&[("AI_LEDGER_INGEST_TOKEN", "ingest-token-0123456789")]).is_err());
+        assert!(config(&[("TRAUMFAENGER_INGEST_TOKEN", "ingest-token-0123456789")]).is_err());
         assert!(
-            config(&[("AI_LEDGER_INGEST_TOKEN", "short"), ("AI_LEDGER_QUERY_TOKEN", "query-token-0123456789")])
+            config(&[("TRAUMFAENGER_INGEST_TOKEN", "short"), ("TRAUMFAENGER_QUERY_TOKEN", "query-token-0123456789")])
                 .is_err()
         );
         let same = "same-token-0123456789";
-        assert!(config(&[("AI_LEDGER_INGEST_TOKEN", same), ("AI_LEDGER_QUERY_TOKEN", same)]).is_err());
+        assert!(config(&[("TRAUMFAENGER_INGEST_TOKEN", same), ("TRAUMFAENGER_QUERY_TOKEN", same)]).is_err());
 
         let ok = config(&[
-            ("AI_LEDGER_INGEST_TOKEN", "ingest-token-0123456789"),
-            ("AI_LEDGER_QUERY_TOKEN", "query-token-0123456789"),
+            ("TRAUMFAENGER_INGEST_TOKEN", "ingest-token-0123456789"),
+            ("TRAUMFAENGER_QUERY_TOKEN", "query-token-0123456789"),
         ])
         .unwrap();
         assert_eq!(ok.ingest_addr.port(), 7600);
         assert_eq!(ok.query_addr.port(), 7601);
 
-        let open = config(&[("AI_LEDGER_AUTH", "disabled")]).unwrap();
+        let open = config(&[("TRAUMFAENGER_AUTH", "disabled")]).unwrap();
         assert!(open.ingest_token.is_none() && open.query_token.is_none());
-        assert!(config(&[("AI_LEDGER_AUTH", "off")]).is_err());
+        assert!(config(&[("TRAUMFAENGER_AUTH", "off")]).is_err());
 
         assert_eq!(open.retention_days, None);
-        let days = config(&[("AI_LEDGER_AUTH", "disabled"), ("AI_LEDGER_RETENTION_DAYS", "30")]).unwrap();
+        let days = config(&[("TRAUMFAENGER_AUTH", "disabled"), ("TRAUMFAENGER_RETENTION_DAYS", "30")]).unwrap();
         assert_eq!(days.retention_days, Some(30));
-        assert!(config(&[("AI_LEDGER_AUTH", "disabled"), ("AI_LEDGER_RETENTION_DAYS", "0")]).is_err());
+        assert!(config(&[("TRAUMFAENGER_AUTH", "disabled"), ("TRAUMFAENGER_RETENTION_DAYS", "0")]).is_err());
     }
 }

@@ -2,7 +2,7 @@
 // what goes over the wire into canonical `Exchange` records and hands them to
 // the sender. Recording never changes what the caller sends or receives.
 import { AsyncLocalStorage } from "node:async_hooks";
-import { type Direction, type Exchange, type ExchangeEnd, type Frame, LIMITS, type Transport } from "@traumwohnung/ai-ledger-api";
+import { type Direction, type Exchange, type ExchangeEnd, type Frame, LIMITS, type Transport } from "@traumfaenger/api";
 import { type Encoding, Sender, type SenderStats, type SocketFactory } from "./sender.ts";
 import {
     binaryPlaceholder,
@@ -17,18 +17,16 @@ import {
     SseSplitter,
 } from "./text.ts";
 
-/** Operation name of exchanges recorded outside `ledger.operation(...)`. */
+/** Operation name of exchanges recorded outside `database.operation(...)`. */
 export const UNATTRIBUTED = "unattributed";
 
-export interface LedgerOptions {
-    /** Base URL of the ingestion listener, for example `http://ai-ledger:7600`. */
+export interface DatabaseOptions {
+    /** Base URL of the ingestion listener, for example `http://traumfaenger:7600`. */
     ingestUrl: string;
     /** Bearer token of the ingestion API. */
     token?: string;
-    /** Name of this service, for example `traumwohnung-web`. */
+    /** Name of this service, for example `my-service`. Use one database per environment. */
     service: string;
-    /** For example `production`, `dev` or `local`. */
-    environment: string;
     /** Encoding of the ingestion socket. `msgpack` (default) or `json`. */
     encoding?: Encoding;
     /** How often queued exchanges are sent. Defaults to 2 seconds. */
@@ -41,7 +39,7 @@ export interface LedgerOptions {
     segmentIntervalMs?: number;
     /** ...or once a segment has this many frames. Defaults to 500. */
     maxSegmentFrames?: number;
-    /** Give up on connecting to ai-ledger after this long. Defaults to 10 seconds. */
+    /** Give up on connecting to traumfaenger after this long. Defaults to 10 seconds. */
     connectTimeoutMs?: number;
     /** Reconnect when a batch has no ack after this long. Defaults to 30 seconds. */
     ackTimeoutMs?: number;
@@ -51,7 +49,7 @@ export interface LedgerOptions {
     socketFactory?: SocketFactory;
 }
 
-/** Context of the exchanges recorded inside `ledger.operation(...)`. */
+/** Context of the exchanges recorded inside `database.operation(...)`. */
 export interface OperationContext {
     /** The kind of work, for example `listing.parse`. */
     operation: string;
@@ -61,9 +59,9 @@ export interface OperationContext {
     metadata?: Record<string, string>;
 }
 
-export type LedgerStats = SenderStats;
+export type DatabaseStats = SenderStats;
 
-/** The subset of the WebSocket API `ledger.socket` needs (standard `WebSocket`, `ws`, Bun). */
+/** The subset of the WebSocket API `database.socket` needs (standard `WebSocket`, `ws`, Bun). */
 export interface RecordableSocket {
     readonly url?: string;
     readonly readyState: number;
@@ -71,7 +69,7 @@ export interface RecordableSocket {
     addEventListener(type: "open" | "message" | "close" | "error", listener: (event: any) => void): void;
 }
 
-export interface Ledger {
+export interface Database {
     /**
      * Wraps a fetch function so every call through it is recorded, as `http`
      * or, for `text/event-stream` responses, as `sse`. Pass the result as the
@@ -98,27 +96,22 @@ export interface Ledger {
      * Never throws; what is left is reported to `onError` and in `stats()`.
      */
     close(timeoutMs?: number): Promise<void>;
-    stats(): LedgerStats;
+    stats(): DatabaseStats;
 }
 
-type Context = Pick<Exchange, "service" | "environment" | "operation" | "session_id" | "metadata"> & {
+type Context = Pick<Exchange, "service" | "operation" | "session_id" | "metadata"> & {
     /** Context had to be shortened or partly dropped to fit the limits. */
     clipped: boolean;
 };
 
-export function createLedger(options: LedgerOptions): Ledger {
-    for (const [name, value] of [
-        ["service", options.service],
-        ["environment", options.environment],
-    ] as const) {
-        if (!isLine(value)) {
-            throw new Error(`ai-ledger: \`${name}\` must be a non-empty single line of at most ${LIMITS.maxNameLen} bytes`);
-        }
+export function createDatabase(options: DatabaseOptions): Database {
+    if (!isLine(options.service)) {
+        throw new Error(`traumfaenger: \`service\` must be a non-empty single line of at most ${LIMITS.maxNameLen} bytes`);
     }
     const storage = new AsyncLocalStorage<OperationContext>();
     const senderOptions: ConstructorParameters<typeof Sender>[0] = {
         ingestUrl: options.ingestUrl,
-        onError: options.onError ?? ((error: unknown) => console.warn("[ai-ledger]", error)),
+        onError: options.onError ?? ((error: unknown) => console.warn("[traumfaenger]", error)),
     };
     for (const key of [
         "token",
@@ -143,7 +136,6 @@ export function createLedger(options: LedgerOptions): Ledger {
         const metadata = cleanMetadata(current?.metadata);
         const fields: Context = {
             service: options.service,
-            environment: options.environment,
             operation: operation.value ?? UNATTRIBUTED,
             clipped: operation.clipped || sessionId.clipped || metadata.clipped,
         };
@@ -323,7 +315,7 @@ async function recordFetch(
     const record = (transport: Transport, status: number | undefined, inFrames: InFrame[], end: ExchangeEnd, truncated = false) => {
         request
             .body()
-            .catch((error: unknown) => `[ai-ledger: unreadable request: ${describe(error)}]`)
+            .catch((error: unknown) => `[traumfaenger: unreadable request: ${describe(error)}]`)
             .then((body) => {
                 const frames = new Frames();
                 frames.add(0, "out", body);
@@ -464,7 +456,7 @@ class StreamEvents {
         if (this.#droppedEvents === 0) return [...this.head, ...this.tail];
         const marker = {
             t: this.#droppedAt,
-            data: `[ai-ledger: omitted ${this.#droppedEvents} events, ${this.#droppedBytes} bytes]`,
+            data: `[traumfaenger: omitted ${this.#droppedEvents} events, ${this.#droppedBytes} bytes]`,
         };
         return [...this.head, marker, ...this.tail];
     }

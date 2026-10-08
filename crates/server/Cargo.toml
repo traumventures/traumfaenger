@@ -1,12 +1,12 @@
 [package]
-name = "ai-ledger-server"
-description = "Standalone AI exchange ledger: DuckDB raw log with a WebSocket ingestion API and a separate query API."
+name = "traumfaenger-server"
+description = "traumfaenger server: DuckDB raw log of AI provider exchanges with a WebSocket ingestion API and a separate query API."
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-ai-ledger-api.workspace = true
+traumfaenger-api.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 chrono.workspace = true
 duckdb = { version = "1", features = ["bundled"] }

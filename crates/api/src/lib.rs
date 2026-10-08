@@ -1,6 +1,6 @@
-//! The ai-ledger wire contract.
+//! The traumfaenger wire contract.
 //!
-//! ai-ledger records AI provider traffic in two steps:
+//! traumfaenger records AI provider traffic in two steps:
 //!
 //! 1. **Ingestion** (this version): clients record every exchange with a
 //!    provider (an HTTP call, an SSE stream or a WebSocket session) in one
@@ -48,9 +48,9 @@ pub mod routes {
 /// its order of preference; the server picks MessagePack when offered.
 pub mod protocols {
     /// Text messages carrying JSON.
-    pub const JSON: &str = "ai-ledger.v1.json";
+    pub const JSON: &str = "traumfaenger.v1.json";
     /// Binary messages carrying MessagePack (maps with field names).
-    pub const MSGPACK: &str = "ai-ledger.v1.msgpack";
+    pub const MSGPACK: &str = "traumfaenger.v1.msgpack";
 }
 
 /// Limits enforced by the server. Exported to TypeScript as `LIMITS`.
@@ -63,7 +63,7 @@ pub mod limits {
     /// Batches the server accepts before acknowledging; more wait.
     pub const MAX_IN_FLIGHT_BATCHES: usize = 4;
     pub const MAX_ID_LEN: usize = 128;
-    /// Maximum length of `service`, `environment`, `operation` and `session_id`.
+    /// Maximum length of `service`, `operation` and `session_id`.
     pub const MAX_NAME_LEN: usize = 256;
     pub const MAX_URL_LEN: usize = 2_048;
     /// Maximum number of frames in one exchange record (one segment).
@@ -213,10 +213,9 @@ pub struct Exchange {
     #[serde(rename = "final", default = "yes", skip_serializing_if = "is_true")]
     #[ts(rename = "final", optional, as = "Option<bool>")]
     pub is_final: bool,
-    /// The emitting service, for example `traumwohnung-web`.
+    /// The emitting service, for example `my-service`. Environments are kept
+    /// apart by running one database per environment.
     pub service: String,
-    /// For example `production`, `dev` or `local`.
-    pub environment: String,
     /// The kind of work, for example `listing.parse`.
     pub operation: String,
     /// Groups the exchanges of one conversation, for example one support chat.
@@ -259,7 +258,6 @@ impl Exchange {
     pub fn validate(&self) -> Result<(), String> {
         check_line("id", &self.id, limits::MAX_ID_LEN)?;
         check_line("service", &self.service, limits::MAX_NAME_LEN)?;
-        check_line("environment", &self.environment, limits::MAX_NAME_LEN)?;
         check_line("operation", &self.operation, limits::MAX_NAME_LEN)?;
         if let Some(session_id) = &self.session_id {
             check_line("session_id", session_id, limits::MAX_NAME_LEN)?;
@@ -457,7 +455,6 @@ pub struct LogEntry {
     #[ts(type = "string")]
     pub received_at: DateTime<Utc>,
     pub service: String,
-    pub environment: String,
     pub operation: String,
     pub session_id: Option<String>,
     #[ts(type = "Record<string, string>")]
@@ -481,7 +478,6 @@ pub struct LogEntry {
 pub struct StoredExchange {
     pub id: String,
     pub service: String,
-    pub environment: String,
     pub operation: String,
     pub session_id: Option<String>,
     #[ts(type = "Record<string, string>")]
@@ -511,9 +507,6 @@ pub struct ListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub service: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub environment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub operation: Option<String>,
@@ -558,7 +551,6 @@ pub struct ListResponse {
 #[serde(rename_all = "snake_case")]
 pub enum Dimension {
     Service,
-    Environment,
     Operation,
     SessionId,
     Transport,
@@ -568,21 +560,12 @@ pub enum Dimension {
 }
 
 impl Dimension {
-    pub const ALL: [Self; 8] = [
-        Self::Service,
-        Self::Environment,
-        Self::Operation,
-        Self::SessionId,
-        Self::Transport,
-        Self::Status,
-        Self::Day,
-        Self::Hour,
-    ];
+    pub const ALL: [Self; 7] =
+        [Self::Service, Self::Operation, Self::SessionId, Self::Transport, Self::Status, Self::Day, Self::Hour];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Service => "service",
-            Self::Environment => "environment",
             Self::Operation => "operation",
             Self::SessionId => "session_id",
             Self::Transport => "transport",
@@ -604,9 +587,6 @@ pub struct SummaryQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub service: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub environment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub operation: Option<String>,
@@ -728,7 +708,6 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "id": "x1",
             "service": "web",
-            "environment": "production",
             "operation": "listing.parse",
             "metadata": { "listing_id": "123" },
             "transport": "http",
@@ -844,7 +823,7 @@ mod tests {
         let committed = std::fs::read_to_string(path).unwrap_or_default();
         assert!(
             committed == typescript_bindings(),
-            "packages/api/src/generated.ts is stale; run `cargo run -p ai-ledger-api --bin gen-ts`"
+            "packages/api/src/generated.ts is stale; run `cargo run -p traumfaenger-api --bin gen-ts`"
         );
     }
 }

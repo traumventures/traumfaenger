@@ -5,10 +5,10 @@ import { join } from "node:path";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, streamText } from "ai";
 import {
-    createLedger,
+    createDatabase,
     LIMITS,
-    type Ledger,
-    type LedgerOptions,
+    type Database,
+    type DatabaseOptions,
     prepareData,
     QueryClient,
     type SocketFactory,
@@ -30,18 +30,17 @@ let server: ReturnType<typeof Bun.spawn> | undefined;
 const query = new QueryClient({ baseUrl: `http://127.0.0.1:${queryPort}`, token: queryToken });
 const errors: unknown[] = [];
 
-function makeLedger(overrides: Partial<LedgerOptions> = {}): Ledger {
-    return createLedger({
+function makeDatabase(overrides: Partial<DatabaseOptions> = {}): Database {
+    return createDatabase({
         ingestUrl,
         token: ingestToken,
         service: "test-service",
-        environment: "test",
         flushIntervalMs: 60_000,
         onError: (error) => errors.push(error),
         ...overrides,
     });
 }
-const ledger = makeLedger();
+const database = makeDatabase();
 
 const SSE_EVENTS = [
     'data: {"choices":[{"delta":{"content":"Hal"}}]}',
@@ -123,17 +122,17 @@ function openAiResponse(stream: boolean): Response {
 }
 
 beforeAll(async () => {
-    const build = Bun.spawnSync(["cargo", "build", "-q", "-p", "ai-ledger-server"], { cwd: root, stderr: "inherit" });
+    const build = Bun.spawnSync(["cargo", "build", "-q", "-p", "traumfaenger-server"], { cwd: root, stderr: "inherit" });
     if (build.exitCode !== 0) throw new Error("cargo build failed");
-    server = Bun.spawn([join(root, "target/debug/ai-ledger-server")], {
+    server = Bun.spawn([join(root, "target/debug/traumfaenger-server")], {
         cwd: root,
         env: {
             ...process.env,
-            AI_LEDGER_DATABASE: ":memory:",
-            AI_LEDGER_INGEST_ADDR: `127.0.0.1:${ingestPort}`,
-            AI_LEDGER_QUERY_ADDR: `127.0.0.1:${queryPort}`,
-            AI_LEDGER_INGEST_TOKEN: ingestToken,
-            AI_LEDGER_QUERY_TOKEN: queryToken,
+            TRAUMFAENGER_DATABASE: ":memory:",
+            TRAUMFAENGER_INGEST_ADDR: `127.0.0.1:${ingestPort}`,
+            TRAUMFAENGER_QUERY_ADDR: `127.0.0.1:${queryPort}`,
+            TRAUMFAENGER_INGEST_TOKEN: ingestToken,
+            TRAUMFAENGER_QUERY_TOKEN: queryToken,
             RUST_LOG: "warn",
         },
         stderr: "inherit",
@@ -146,19 +145,19 @@ beforeAll(async () => {
             await Bun.sleep(50);
         }
     }
-    throw new Error("ai-ledger-server did not become healthy");
+    throw new Error("traumfaenger-server did not become healthy");
 }, 300_000);
 
 afterAll(async () => {
-    await ledger.close();
+    await database.close();
     provider.stop(true);
     server?.kill();
 });
 
-const recorded = ledger.fetch();
+const recorded = database.fetch();
 
 /** Waits for background reads to finish, then sends everything. */
-async function settle(target: Ledger = ledger): Promise<void> {
+async function settle(target: Database = database): Promise<void> {
     await Bun.sleep(30);
     await target.flush();
 }
@@ -174,7 +173,7 @@ async function only(operation: string): Promise<StoredExchange> {
 
 test("records a JSON call as an http exchange with its context", async () => {
     const requestBody = JSON.stringify({ model: "m", messages: [{ role: "user", content: "Hi" }] });
-    const response = await ledger.operation(
+    const response = await database.operation(
         { operation: "listing.parse", sessionId: "s-1", metadata: { listing_id: "123" } },
         () => recorded(`${providerUrl}?key=secret`, { method: "POST", body: requestBody })
     );
@@ -184,7 +183,6 @@ test("records a JSON call as an http exchange with its context", async () => {
     const exchange = await only("listing.parse");
     expect(exchange).toMatchObject({
         service: "test-service",
-        environment: "test",
         session_id: "s-1",
         metadata: { listing_id: "123" },
         transport: "http",
@@ -203,7 +201,7 @@ test("records a JSON call as an http exchange with its context", async () => {
 });
 
 test("records a stream as sse frames and passes it through unchanged", async () => {
-    const response = await ledger.operation({ operation: "support.chat" }, () =>
+    const response = await database.operation({ operation: "support.chat" }, () =>
         recorded(providerUrl, { method: "POST", body: JSON.stringify({ stream: true }) })
     );
     expect(response.headers.get("content-type")).toContain("text/event-stream");
@@ -217,7 +215,7 @@ test("records a stream as sse frames and passes it through unchanged", async () 
 });
 
 test("stamps each event with the time it arrived", async () => {
-    await ledger.operation({ operation: "slow.stream" }, async () => {
+    await database.operation({ operation: "slow.stream" }, async () => {
         await (await recorded(providerUrl, { method: "POST", body: JSON.stringify({ slow: true }) })).text();
     });
     await settle();
@@ -231,7 +229,7 @@ test("stamps each event with the time it arrived", async () => {
 });
 
 test("records a cancelled stream with its partial events", async () => {
-    const response = await ledger.operation({ operation: "cancelled.chat" }, () =>
+    const response = await database.operation({ operation: "cancelled.chat" }, () =>
         recorded(providerUrl, { method: "POST", body: JSON.stringify({ endless: true }) })
     );
     const reader = response.body!.getReader();
@@ -249,7 +247,7 @@ test("records a cancelled stream with its partial events", async () => {
 });
 
 test("records network failures and rethrows them to the caller", async () => {
-    const failure = await ledger
+    const failure = await database
         .operation({ operation: "unreachable" }, () => recorded("http://127.0.0.1:1/v1/chat", { method: "POST", body: "{}" }))
         .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(Error);
@@ -262,8 +260,8 @@ test("records network failures and rethrows them to the caller", async () => {
 });
 
 test("nested operations merge metadata; calls outside any operation are unattributed", async () => {
-    await ledger.operation({ operation: "outer", sessionId: "s-2", metadata: { a: "1", b: "1" } }, () =>
-        ledger.operation({ operation: "inner.step", metadata: { b: "2" } }, async () => {
+    await database.operation({ operation: "outer", sessionId: "s-2", metadata: { a: "1", b: "1" } }, () =>
+        database.operation({ operation: "inner.step", metadata: { b: "2" } }, async () => {
             await (await recorded(providerUrl, { method: "POST", body: "{}" })).text();
         })
     );
@@ -280,14 +278,14 @@ test("works as the fetch of an AI SDK provider", async () => {
     const sdk = createOpenAICompatible({
         name: "test",
         baseURL: `http://127.0.0.1:${provider.port}/api/v1`,
-        fetch: ledger.fetch(),
+        fetch: database.fetch(),
         includeUsage: true,
     });
-    const generated = await ledger.operation({ operation: "sdk.generate" }, () =>
+    const generated = await database.operation({ operation: "sdk.generate" }, () =>
         generateText({ model: sdk("sdk-model"), prompt: "Hi" })
     );
     expect(generated.text).toBe("Hallo");
-    const streamed = await ledger.operation({ operation: "sdk.stream", sessionId: "chat-9" }, async () => {
+    const streamed = await database.operation({ operation: "sdk.stream", sessionId: "chat-9" }, async () => {
         return await streamText({ model: sdk("sdk-model"), prompt: "Hi" }).text;
     });
     expect(streamed).toBe("Hallo");
@@ -302,7 +300,7 @@ test("works as the fetch of an AI SDK provider", async () => {
 });
 
 test("records a provider WebSocket session in segments", async () => {
-    const segmented = makeLedger({ maxSegmentFrames: 3, encoding: "json" });
+    const segmented = makeDatabase({ maxSegmentFrames: 3, encoding: "json" });
     const audio = "A".repeat(4_000);
     const ws = segmented.operation({ operation: "voice.interview", sessionId: "iv-1" }, () =>
         segmented.socket(new WebSocket(`ws://127.0.0.1:${provider.port}/realtime?token=secret`))
@@ -339,11 +337,11 @@ test("records a provider WebSocket session in segments", async () => {
     expect(data).toEqual([
         // Wire order: all three sends go out before the first reply arrives.
         'out {"type":"session.update"}',
-        'out {"type":"input_audio_buffer.append","audio":"[ai-ledger: omitted base64, 3000 bytes]"}',
-        "out [ai-ledger: unrecorded binary message, 16 bytes]",
+        'out {"type":"input_audio_buffer.append","audio":"[traumfaenger: omitted base64, 3000 bytes]"}',
+        "out [traumfaenger: unrecorded binary message, 16 bytes]",
         'in {"type":"transcript.delta","delta":"got session.update"}',
         'in {"type":"transcript.delta","delta":"got input_audio_buffer.append"}',
-        "in [ai-ledger: unrecorded binary message, 32 bytes]",
+        "in [traumfaenger: unrecorded binary message, 32 bytes]",
         'out {"type":"bye"}',
         'in {"type":"transcript.delta","delta":"got bye"}',
     ]);
@@ -353,7 +351,7 @@ test("records a provider WebSocket session in segments", async () => {
 
 test("broken strings and invalid context are cleaned instead of losing the exchange", async () => {
     const cut = "😀".slice(0, 1); // a lone surrogate
-    await ledger.operation(
+    await database.operation(
         {
             operation: `odd${cut}`,
             sessionId: "",
@@ -372,7 +370,7 @@ test("broken strings and invalid context are cleaned instead of losing the excha
     expect(exchange.metadata["bad key"]).toBeUndefined();
     expect(exchange.metadata.long?.length).toBe(LIMITS.maxMetadataValueLen);
     expect(exchange.frames[0]?.data).toBe('{"text":"\uFFFD"}');
-    expect(ledger.stats().rejected).toBe(0);
+    expect(database.stats().rejected).toBe(0);
 });
 
 test("binary responses are not buffered; oversized text is clipped to the limits", async () => {
@@ -382,16 +380,16 @@ test("binary responses are not buffered; oversized text is clipped to the limits
         new Response(new Uint8Array(LIMITS.maxFrameBytes).fill(0xe4), {
             headers: { "content-type": "text/plain" },
         })) as unknown as typeof fetch;
-    await ledger.operation({ operation: "speech" }, async () => {
-        const response = await ledger.fetch(audio)(`${providerUrl}/speech`, { method: "POST", body: "{}" });
+    await database.operation({ operation: "speech" }, async () => {
+        const response = await database.fetch(audio)(`${providerUrl}/speech`, { method: "POST", body: "{}" });
         expect((await response.arrayBuffer()).byteLength).toBe(16);
     });
-    await ledger.operation({ operation: "latin1" }, async () => {
-        await (await ledger.fetch(latin1)(providerUrl, { method: "POST", body: "{}" })).arrayBuffer();
+    await database.operation({ operation: "latin1" }, async () => {
+        await (await database.fetch(latin1)(providerUrl, { method: "POST", body: "{}" })).arrayBuffer();
     });
     await settle();
 
-    expect((await only("speech")).frames[1]?.data).toBe("[ai-ledger: unrecorded audio/mpeg, 16 bytes]");
+    expect((await only("speech")).frames[1]?.data).toBe("[traumfaenger: unrecorded audio/mpeg, 16 bytes]");
     const clipped = await only("latin1");
     expect(clipped.truncated).toBe(true);
     expect(new TextEncoder().encode(clipped.frames[1]?.data).byteLength).toBeLessThanOrEqual(LIMITS.maxFrameBytes);
@@ -408,7 +406,7 @@ function fakeSocket(
             for (const listener of listeners.get(type) ?? []) listener(event);
         };
         const socket = {
-            protocol: protocols.includes("ai-ledger.v1.json") ? "ai-ledger.v1.json" : "",
+            protocol: protocols.includes("traumfaenger.v1.json") ? "traumfaenger.v1.json" : "",
             binaryType: "blob",
             send(data: string | Uint8Array) {
                 options.onSend?.();
@@ -429,7 +427,7 @@ function fakeSocket(
 }
 
 test("server rejections and a throwing onError never reach the caller", async () => {
-    const rejecting = makeLedger({
+    const rejecting = makeDatabase({
         encoding: "json",
         socketFactory: fakeSocket((batch) => ({
             type: "ack",
@@ -448,8 +446,8 @@ test("server rejections and a throwing onError never reach the caller", async ()
     expect(rejecting.stats()).toMatchObject({ rejected: 1, queued: 0 });
 });
 
-test("an unreachable ledger backs off and keeps the exchanges queued", async () => {
-    const offline = makeLedger({ ingestUrl: "http://127.0.0.1:1", onError: () => {} });
+test("an unreachable database backs off and keeps the exchanges queued", async () => {
+    const offline = makeDatabase({ ingestUrl: "http://127.0.0.1:1", onError: () => {} });
     const response = await offline.fetch()(providerUrl, { method: "POST", body: "{}" });
     expect(response.status).toBe(200);
     await response.text();
@@ -463,8 +461,8 @@ test("an unreachable ledger backs off and keeps the exchanges queued", async () 
     expect(offline.stats().failedSends).toBeGreaterThanOrEqual(2);
 });
 
-test("close() honours its deadline against a ledger that never acknowledges", async () => {
-    const silent = makeLedger({ encoding: "json", socketFactory: fakeSocket(() => undefined), onError: () => {} });
+test("close() honours its deadline against a database that never acknowledges", async () => {
+    const silent = makeDatabase({ encoding: "json", socketFactory: fakeSocket(() => undefined), onError: () => {} });
     await (await silent.fetch()(providerUrl, { method: "POST", body: "{}" })).text();
     await Bun.sleep(20);
     const start = performance.now();
@@ -479,7 +477,7 @@ test("close() honours its deadline against a ledger that never acknowledges", as
 
 test("a server error backs off instead of resending in a loop", async () => {
     let sends = 0;
-    const failing = makeLedger({
+    const failing = makeDatabase({
         encoding: "json",
         onError: () => {},
         socketFactory: fakeSocket((batch) => ({ type: "error", batch: batch.id, error: "internal", message: "db down" }), {
@@ -495,7 +493,7 @@ test("a server error backs off instead of resending in a loop", async () => {
 });
 
 test("an error without a batch id settles the oldest batch", async () => {
-    const refusing = makeLedger({
+    const refusing = makeDatabase({
         encoding: "json",
         onError: () => {},
         socketFactory: fakeSocket(() => ({ type: "error", batch: null, error: "invalid_request", message: "bad" })),
@@ -511,7 +509,7 @@ test("missing acks and hanging connects time out and back off", async () => {
         ["ack", fakeSocket(() => undefined)],
         ["connect", fakeSocket(() => undefined, { opens: false })],
     ] as const) {
-        const stuck = makeLedger({ encoding: "json", ackTimeoutMs: 100, connectTimeoutMs: 100, socketFactory, onError: () => {} });
+        const stuck = makeDatabase({ encoding: "json", ackTimeoutMs: 100, connectTimeoutMs: 100, socketFactory, onError: () => {} });
         await (await stuck.fetch()(providerUrl, { method: "POST", body: "{}" })).text();
         await Bun.sleep(30);
         const start = performance.now();
@@ -523,7 +521,7 @@ test("missing acks and hanging connects time out and back off", async () => {
 });
 
 test("long streams keep their start and end", async () => {
-    await ledger.operation({ operation: "long.stream" }, async () => {
+    await database.operation({ operation: "long.stream" }, async () => {
         await (await recorded(providerUrl, { method: "POST", body: JSON.stringify({ many: 12_000 }) })).text();
     });
     await settle();
@@ -531,7 +529,7 @@ test("long streams keep their start and end", async () => {
     expect(exchange.truncated).toBe(true);
     expect(exchange.frames.length).toBeLessThanOrEqual(LIMITS.maxFrames);
     expect(exchange.frames[1]?.data).toBe('data: {"n":0}');
-    expect(exchange.frames.some((frame) => /^\[ai-ledger: omitted \d+ events/.test(frame.data))).toBe(true);
+    expect(exchange.frames.some((frame) => /^\[traumfaenger: omitted \d+ events/.test(frame.data))).toBe(true);
     expect(exchange.frames.slice(-2).map((frame) => frame.data)).toEqual([
         'data: {"usage":{"prompt_tokens":9}}',
         "data: [DONE]",
@@ -548,13 +546,13 @@ test("socket recording keeps send arguments and handles late attachment", async 
         },
         addEventListener() {},
     };
-    ledger.socket(fake).send("{}", { binary: false }, () => {
+    database.socket(fake).send("{}", { binary: false }, () => {
         callback = true;
     });
     expect(callback).toBe(true);
 
-    ledger.operation({ operation: "late.socket" }, () =>
-        ledger.socket({ ...fake, url: "wss://api.example.com/late", readyState: 3 })
+    database.operation({ operation: "late.socket" }, () =>
+        database.socket({ ...fake, url: "wss://api.example.com/late", readyState: 3 })
     );
     await settle();
     const late = await only("late.socket");
@@ -587,9 +585,9 @@ test("splits SSE text into events across chunk boundaries", () => {
 test("replaces inline base64 payloads but keeps everything else", () => {
     const image = `data:image/png;base64,${"A".repeat(4000)}`;
     expect(prepareData(JSON.stringify({ image_url: { url: image } }))).toBe(
-        JSON.stringify({ image_url: { url: "[ai-ledger: omitted image/png data, 3000 bytes]" } })
+        JSON.stringify({ image_url: { url: "[traumfaenger: omitted image/png data, 3000 bytes]" } })
     );
-    expect(prepareData(`{"audio":"${"B".repeat(1024)}"}`)).toBe('{"audio":"[ai-ledger: omitted base64, 768 bytes]"}');
+    expect(prepareData(`{"audio":"${"B".repeat(1024)}"}`)).toBe('{"audio":"[traumfaenger: omitted base64, 768 bytes]"}');
     const short = `{"id":"${"C".repeat(1023)}","n":12345678901234567890}`;
     expect(prepareData(short)).toBe(short);
 });

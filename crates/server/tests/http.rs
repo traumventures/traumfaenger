@@ -2,12 +2,12 @@
 
 use std::{io::Write, net::SocketAddr, sync::Arc};
 
-use ai_ledger_api::protocols;
-use ai_ledger_server::{http, store::Store};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest, http::HeaderValue};
+use traumfaenger_api::protocols;
+use traumfaenger_server::{http, store::Store};
 
 const INGEST_TOKEN: &str = "ingest-token-0123456789";
 const QUERY_TOKEN: &str = "query-token-0123456789";
@@ -114,8 +114,7 @@ async fn connect(addr: SocketAddr, token: Option<&str>, protocols: &str) -> Resu
 fn exchange(id: &str, operation: &str) -> Value {
     json!({
         "id": id,
-        "service": "traumwohnung-web",
-        "environment": "production",
+        "service": "my-service",
         "operation": operation,
         "session_id": "chat-1",
         "metadata": { "listing_id": "42" },
@@ -135,7 +134,7 @@ fn exchange(id: &str, operation: &str) -> Value {
 fn ws_segment(id: &str, segment: u32, is_final: bool) -> Value {
     let mut value = exchange(id, "voice.interview");
     value["transport"] = json!("ws");
-    value["url"] = json!("wss://api.deepslate.example/v1/realtime");
+    value["url"] = json!("wss://api.voice.example/v1/realtime");
     value["status"] = json!(101);
     value["segment"] = json!(segment);
     value["final"] = json!(is_final);
@@ -292,7 +291,7 @@ async fn query_api_lists_gets_and_summarises() {
     assert_eq!((status, body["error"].as_str()), (404, Some("not_found")));
     let (status, body) = servers.get("/v1/summary?group_by=service,transport").await;
     assert_eq!(status, 200);
-    assert_eq!(body["rows"][0]["group"], json!({ "service": "traumwohnung-web", "transport": "sse" }));
+    assert_eq!(body["rows"][0]["group"], json!({ "service": "my-service", "transport": "sse" }));
     assert_eq!(
         (body["rows"][0]["exchanges"].as_u64(), body["rows"][0]["duration_ms_avg"].as_f64()),
         (Some(2), Some(320.0))

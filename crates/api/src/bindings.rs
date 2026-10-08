@@ -15,7 +15,7 @@ use crate::{
 /// is current.
 pub fn typescript_bindings() -> String {
     let mut out =
-        String::from("// Generated from crates/api by `cargo run -p ai-ledger-api --bin gen-ts`. Do not edit.\n");
+        String::from("// Generated from crates/api by `cargo run -p traumfaenger-api --bin gen-ts`. Do not edit.\n");
     // Fixed defaults instead of `Config::from_env()`: output must not depend on the environment.
     let cfg = Config::new();
     for declaration in [

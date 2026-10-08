@@ -1,7 +1,7 @@
-// The ingestion connection: one WebSocket to ai-ledger that carries batches
+// The ingestion connection: one WebSocket to traumfaenger that carries batches
 // of exchanges, pipelined, with in-order acks.
 import { decode, encode } from "@msgpack/msgpack";
-import { type Exchange, LIMITS, PROTOCOLS, ROUTES, type ServerMessage } from "@traumwohnung/ai-ledger-api";
+import { type Exchange, LIMITS, PROTOCOLS, ROUTES, type ServerMessage } from "@traumfaenger/api";
 import { byteLength, clipBytes } from "./text.ts";
 
 /** The subset of the WebSocket API the sender uses (standard `WebSocket`, `ws`, Bun, undici). */
@@ -25,7 +25,7 @@ export const defaultSocketFactory: SocketFactory = (url, protocols, headers) =>
 export type Encoding = "msgpack" | "json";
 
 export interface SenderOptions {
-    /** Base URL of the ingestion listener, for example `http://ai-ledger:7600` or `ws://ai-ledger:7600`. */
+    /** Base URL of the ingestion listener, for example `http://traumfaenger:7600` or `ws://traumfaenger:7600`. */
     ingestUrl: string;
     token?: string;
     /** Preferred encoding. `msgpack` (default) offers both and lets the server choose; `json` offers only JSON. */
@@ -138,14 +138,14 @@ export class Sender {
     push(exchange: Exchange): void {
         if (this.#closed) {
             this.#stats.dropped++;
-            this.#onError(new Error("ai-ledger: exchange recorded after close() was dropped"));
+            this.#onError(new Error("traumfaenger: exchange recorded after close() was dropped"));
             return;
         }
         // JSON size is an upper bound of the MessagePack size, so batches fit either encoding.
         const bytes = byteLength(JSON.stringify(exchange));
         if (bytes > LIMITS.maxBatchBytes - 1024) {
             this.#stats.dropped++;
-            this.#onError(new Error(`ai-ledger: dropped an exchange of ${bytes} bytes, larger than a batch may be`));
+            this.#onError(new Error(`traumfaenger: dropped an exchange of ${bytes} bytes, larger than a batch may be`));
             return;
         }
         this.#queue.push({ exchange, bytes });
@@ -157,7 +157,7 @@ export class Sender {
         }
         if (dropped > 0) {
             this.#stats.dropped += dropped;
-            this.#onError(new Error(`ai-ledger: queue full, dropped ${dropped} oldest exchanges`));
+            this.#onError(new Error(`traumfaenger: queue full, dropped ${dropped} oldest exchanges`));
         }
         if (this.#queuedBytes >= this.#maxBatchBytes || this.#queue.length >= LIMITS.maxBatchSize) this.#kick();
     }
@@ -203,7 +203,7 @@ export class Sender {
         }
         clearInterval(this.#watchdog);
         const left = this.stats().queued;
-        if (left > 0) this.#onError(new Error(`ai-ledger: closed with ${left} exchanges unsent`));
+        if (left > 0) this.#onError(new Error(`traumfaenger: closed with ${left} exchanges unsent`));
         this.#lose("closed by the client", false);
     }
 
@@ -304,7 +304,7 @@ export class Sender {
                 // Already closed.
             }
         }
-        if (failure && !this.#isIdle()) this.#failed(new Error(`ai-ledger: ${reason}`));
+        if (failure && !this.#isIdle()) this.#failed(new Error(`traumfaenger: ${reason}`));
         else this.#notify();
     }
 
@@ -382,7 +382,7 @@ export class Sender {
             if (rejected.length > 0) {
                 this.#stats.rejected += rejected.length;
                 const reasons = rejected.slice(0, 3).map((r) => `#${r.index}: ${r.reason}`);
-                this.#onError(new Error(`ai-ledger rejected ${rejected.length} exchanges (${reasons.join("; ")})`));
+                this.#onError(new Error(`traumfaenger rejected ${rejected.length} exchanges (${reasons.join("; ")})`));
             }
         } else if (message.error === "internal") {
             // Not stored; send it again after a backoff instead of in a tight loop.
@@ -391,7 +391,7 @@ export class Sender {
             return;
         } else {
             if (batch !== undefined) this.#stats.dropped += batch.items.length;
-            this.#onError(new Error(`ai-ledger refused a batch: ${message.error}: ${message.message}`));
+            this.#onError(new Error(`traumfaenger refused a batch: ${message.error}: ${message.message}`));
         }
         this.#pump();
     }

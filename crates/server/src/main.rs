@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use ai_ledger_server::{config::Config, http, store::Store};
 use tokio::{net::TcpListener, sync::watch};
 use tracing_subscriber::EnvFilter;
+use traumfaenger_server::{config::Config, http, store::Store};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Config::from_env()?;
     if config.ingest_token.is_none() {
-        tracing::warn!("authentication is disabled (AI_LEDGER_AUTH=disabled); bind to a private interface only");
+        tracing::warn!("authentication is disabled (TRAUMFAENGER_AUTH=disabled); bind to a private interface only");
     }
     let store = Arc::new(Store::open(&config.database, config.memory_limit.as_deref())?);
 
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ingest = %ingest_listener.local_addr()?,
         query = %query_listener.local_addr()?,
         database = %config.database,
-        "ai-ledger listening"
+        "traumfaenger listening"
     );
 
     if let Some(days) = config.retention_days {

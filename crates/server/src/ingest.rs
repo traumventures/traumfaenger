@@ -5,9 +5,9 @@
 //! invalid escape, invalid UTF-8) is rejected on its own instead of failing
 //! the whole batch.
 
-use ai_ledger_api::{ErrorCode, Exchange, IngestResult, RejectedExchange, ServerMessage, limits, protocols};
 use chrono::Utc;
 use serde::Deserialize;
+use traumfaenger_api::{ErrorCode, Exchange, IngestResult, RejectedExchange, ServerMessage, limits, protocols};
 
 use crate::store::{Store, StoreError};
 
@@ -180,7 +180,7 @@ mod tests {
 
     fn exchange_json() -> serde_json::Value {
         serde_json::json!({
-            "id": "x", "service": "s", "environment": "e", "operation": "o", "transport": "http",
+            "id": "x", "service": "s", "operation": "o", "transport": "http",
             "url": "https://x/y", "started_at": "2026-10-08T10:00:00Z", "status": 200,
             "frames": [{ "t_ms": 0, "dir": "out", "data": "{}" }],
             "end": { "at_ms": 5, "reason": "complete" },

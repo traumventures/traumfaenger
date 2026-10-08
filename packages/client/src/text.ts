@@ -1,6 +1,6 @@
 // Text preparation shared by the recorders: everything a frame or a context
 // field goes through before it leaves the process.
-import { LIMITS } from "@traumwohnung/ai-ledger-api";
+import { LIMITS } from "@traumfaenger/api";
 
 const encoder = new TextEncoder();
 
@@ -46,13 +46,13 @@ export function prepareData(text: string): string {
     let prepared = text;
     if (prepared.includes(";base64,")) {
         prepared = prepared.replace(DATA_URL, (match, mime: string) => {
-            return `[ai-ledger: omitted ${mime} data, ${decodedBytes(match.length - match.indexOf(",") - 1)} bytes]`;
+            return `[traumfaenger: omitted ${mime} data, ${decodedBytes(match.length - match.indexOf(",") - 1)} bytes]`;
         });
     }
     if (prepared.length >= 1_026) {
         prepared = prepared.replace(
             BASE64_STRING,
-            (_match, payload: string) => `"[ai-ledger: omitted base64, ${decodedBytes(payload.length)} bytes]"`
+            (_match, payload: string) => `"[traumfaenger: omitted base64, ${decodedBytes(payload.length)} bytes]"`
         );
     }
     return wellFormed(prepared);
@@ -60,7 +60,7 @@ export function prepareData(text: string): string {
 
 /** Placeholder for binary data that is not recorded. */
 export function binaryPlaceholder(kind: string, bytes: number | undefined): string {
-    return `[ai-ledger: unrecorded ${kind}${bytes === undefined ? "" : `, ${bytes} bytes`}]`;
+    return `[traumfaenger: unrecorded ${kind}${bytes === undefined ? "" : `, ${bytes} bytes`}]`;
 }
 
 /** A single line of at most `maxNameLen` bytes, or undefined when empty. */

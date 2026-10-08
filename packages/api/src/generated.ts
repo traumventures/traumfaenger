@@ -1,4 +1,4 @@
-// Generated from crates/api by `cargo run -p ai-ledger-api --bin gen-ts`. Do not edit.
+// Generated from crates/api by `cargo run -p traumfaenger-api --bin gen-ts`. Do not edit.
 
 export type Transport = "http" | "sse" | "ws";
 
@@ -36,13 +36,10 @@ segment?: number,
  */
 final?: boolean, 
 /**
- * The emitting service, for example `traumwohnung-web`.
+ * The emitting service, for example `my-service`. Environments are kept
+ * apart by running one database per environment.
  */
 service: string, 
-/**
- * For example `production`, `dev` or `local`.
- */
-environment: string, 
 /**
  * The kind of work, for example `listing.parse`.
  */
@@ -135,7 +132,7 @@ seq: number, id: string, segment: number, final: boolean,
 /**
  * When the server stored the record, RFC 3339.
  */
-received_at: string, service: string, environment: string, operation: string, session_id: string | null, metadata: Record<string, string>, transport: Transport, 
+received_at: string, service: string, operation: string, session_id: string | null, metadata: Record<string, string>, transport: Transport, 
 /**
  * Without query string and fragment.
  */
@@ -145,7 +142,7 @@ url: string, started_at: string, status: number | null, end: ExchangeEnd | null,
  */
 bytes: number, };
 
-export type StoredExchange = { id: string, service: string, environment: string, operation: string, session_id: string | null, metadata: Record<string, string>, transport: Transport, url: string, started_at: string, 
+export type StoredExchange = { id: string, service: string, operation: string, session_id: string | null, metadata: Record<string, string>, transport: Transport, url: string, started_at: string, 
 /**
  * Latest status reported by any segment.
  */
@@ -163,7 +160,7 @@ complete: boolean, truncated: boolean,
  */
 frames: Array<Frame>, end: ExchangeEnd | null, };
 
-export type ListQuery = { service?: string, environment?: string, operation?: string, session_id?: string, transport?: Transport, 
+export type ListQuery = { service?: string, operation?: string, session_id?: string, transport?: Transport, 
 /**
  * True: only final records of failed exchanges (end reason `error`, no
  * status, or status ≥ 400). False: everything else.
@@ -184,9 +181,9 @@ export type ListResponse = { entries: Array<LogEntry>,
  */
 next_cursor: string | null, };
 
-export type Dimension = "service" | "environment" | "operation" | "session_id" | "transport" | "status" | "day" | "hour";
+export type Dimension = "service" | "operation" | "session_id" | "transport" | "status" | "day" | "hour";
 
-export type SummaryQuery = { service?: string, environment?: string, operation?: string, session_id?: string, transport?: Transport, failed?: boolean, from?: string, to?: string, 
+export type SummaryQuery = { service?: string, operation?: string, session_id?: string, transport?: Transport, failed?: boolean, from?: string, to?: string, 
 /**
  * Dimensions to group by, at most once each. Sent as a comma-separated
  * query parameter (`group_by=service,operation`). Empty means one total row.
@@ -235,7 +232,7 @@ export type ErrorCode = "invalid_request" | "unauthorized" | "not_found" | "meth
 
 export type ApiError = { error: ErrorCode, message: string, };
 
-export const DIMENSIONS: readonly Dimension[] = ["service", "environment", "operation", "session_id", "transport", "status", "day", "hour"];
+export const DIMENSIONS: readonly Dimension[] = ["service", "operation", "session_id", "transport", "status", "day", "hour"];
 
 export const ROUTES = {
     health: "/health",
@@ -247,8 +244,8 @@ export const ROUTES = {
 } as const;
 
 export const PROTOCOLS = {
-    json: "ai-ledger.v1.json",
-    msgpack: "ai-ledger.v1.msgpack",
+    json: "traumfaenger.v1.json",
+    msgpack: "traumfaenger.v1.msgpack",
 } as const;
 
 export const LIMITS = {

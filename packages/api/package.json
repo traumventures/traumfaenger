@@ -1,7 +1,7 @@
 {
-    "name": "@traumwohnung/ai-ledger-api",
+    "name": "@traumfaenger/api",
     "version": "0.1.0",
-    "description": "TypeScript types, routes and limits of the ai-ledger HTTP API, generated from Rust.",
+    "description": "TypeScript types, routes and limits of the traumfaenger HTTP API, generated from Rust.",
     "license": "UNLICENSED",
     "type": "module",
     "sideEffects": false,
