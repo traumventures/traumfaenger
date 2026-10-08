@@ -1,0 +1,6 @@
+target
+node_modules
+packages
+*.duckdb
+*.duckdb.wal
+.git

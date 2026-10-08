@@ -1,0 +1,15 @@
+{
+    "name": "ai-ledger",
+    "private": true,
+    "type": "module",
+    "workspaces": ["packages/api", "packages/client"],
+    "scripts": {
+        "gen": "cargo run -q -p ai-ledger-api --bin gen-ts",
+        "typecheck": "tsc -p packages/api && tsc -p packages/client",
+        "test": "bun test packages"
+    },
+    "devDependencies": {
+        "@types/bun": "^1.2.0",
+        "typescript": "^5.9.0"
+    }
+}
