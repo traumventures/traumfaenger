@@ -1,12 +1,40 @@
 // Generated from crates/api by `cargo run -p ai-ledger-api --bin gen-ts`. Do not edit.
 
-export type RawResponse = string | Array<string>;
+export type Transport = "http" | "sse" | "ws";
 
-export type CallRecord = { 
+export type Direction = "out" | "in";
+
+export type Frame = { 
+/**
+ * Milliseconds since `started_at` when the frame was sent or complete.
+ */
+t_ms: number, dir: Direction, data: string, };
+
+export type EndReason = "complete" | "error" | "cancelled" | "closed";
+
+export type ExchangeEnd = { 
+/**
+ * Milliseconds since `started_at`.
+ */
+at_ms: number, reason: EndReason, error?: string, 
+/**
+ * WebSocket close code.
+ */
+close_code?: number, };
+
+export type Exchange = { 
 /**
  * Client-generated unique id, for example a UUID. 1–128 bytes.
  */
 id: string, 
+/**
+ * 0 unless a WebSocket session is sent in parts.
+ */
+segment?: number, 
+/**
+ * False on every segment but the last. Defaults to true.
+ */
+final?: boolean, 
 /**
  * The emitting service, for example `traumwohnung-web`.
  */
@@ -20,112 +48,125 @@ environment: string,
  */
 operation: string, 
 /**
- * Groups the calls of one conversation, for example one support chat.
+ * Groups the exchanges of one conversation, for example one support chat.
  */
 session_id?: string, 
 /**
  * Flat key-value pairs, for example `{ "listing_id": "123" }`. At most 32
  * entries; keys are 1–64 characters of `A-Z a-z 0-9 _ . -`.
  */
-metadata?: Record<string, string>, 
+metadata?: Record<string, string>, transport: Transport, 
 /**
  * The request URL. The server drops query string and fragment.
  */
 url: string, 
 /**
- * The request body exactly as sent.
- */
-request: string, 
-/**
- * The response as received. Absent when no response arrived.
- */
-response?: RawResponse, 
-/**
- * HTTP status of the response. Absent when no response arrived.
- */
-http_status?: number, 
-/**
- * Client-side exception, for example a network failure or an abort.
- */
-error?: string, 
-/**
- * True when the client changed anything to fit the limits: clipped
- * `request` or `response`, or cleaned context (dropped invalid metadata
- * entries, clipped values, an empty operation recorded as `unattributed`).
- */
-truncated?: boolean, 
-/**
- * When the request was sent, RFC 3339.
+ * When the exchange started, RFC 3339. The same for every segment.
  */
 started_at: string, 
 /**
- * Streaming calls only: time until the first response chunk, in milliseconds.
+ * HTTP status of the response; 101 once a WebSocket is open. Absent
+ * when no response arrived.
  */
-ttft_ms?: number, 
+status?: number, 
 /**
- * Time until the response was complete (or failed), in milliseconds.
+ * The frames of this record, in wire order. For HTTP and SSE the request
+ * body is the first `out` frame.
  */
-latency_ms: number, };
+frames: Array<Frame>, 
+/**
+ * Present exactly on final records.
+ */
+end?: ExchangeEnd, 
+/**
+ * True when the client changed anything to fit the limits: clipped or
+ * dropped frames, or cleaned context (invalid metadata entries dropped,
+ * values clipped, an empty operation recorded as `unattributed`).
+ */
+truncated?: boolean, };
 
-export type IngestRequest = { 
+export type ClientMessage = { "type": "batch", 
 /**
- * 1–500 records. Each record is validated on its own: invalid records are
- * reported in `rejected`, the valid ones are stored.
+ * Chosen by the client, echoed in the ack.
  */
-calls: Array<CallRecord>, };
+id: number, exchanges: Array<Exchange>, };
 
-export type RejectedCall = { 
+export type ServerMessage = { "type": "ack", batch: number, 
 /**
- * Position of the record in `calls`.
- */
-index: number, reason: string, };
-
-export type IngestResponse = { 
-/**
- * Records stored by this request.
+ * Records stored by this batch.
  */
 accepted: number, 
 /**
- * Records whose id was already stored, or repeated within the request.
+ * Records already stored, or repeated within the batch.
  */
 duplicates: number, 
 /**
- * Records that failed validation. Retrying them will not succeed.
+ * Records that failed validation. Resending them will not succeed.
  */
-rejected: Array<RejectedCall>, };
+rejected: Array<RejectedExchange>, } | { "type": "error", batch: number | null, error: ErrorCode, message: string, };
 
-export type CallEnvelope = { 
+export type IngestRequest = { exchanges: Array<Exchange>, };
+
+export type RejectedExchange = { 
 /**
- * Position in the ingestion queue; increases with every stored record.
+ * Position in the batch.
  */
-seq: number, id: string, 
+index: number, reason: string, };
+
+export type IngestResult = { 
+/**
+ * Records stored by this batch.
+ */
+accepted: number, 
+/**
+ * Records already stored, or repeated within the batch.
+ */
+duplicates: number, 
+/**
+ * Records that failed validation. Resending them will not succeed.
+ */
+rejected: Array<RejectedExchange>, };
+
+export type LogEntry = { 
+/**
+ * Position in the raw log; increases with every stored record.
+ */
+seq: number, id: string, segment: number, final: boolean, 
 /**
  * When the server stored the record, RFC 3339.
  */
-received_at: string, service: string, environment: string, operation: string, session_id: string | null, metadata: Record<string, string>, 
+received_at: string, service: string, environment: string, operation: string, session_id: string | null, metadata: Record<string, string>, transport: Transport, 
 /**
  * Without query string and fragment.
  */
-url: string, http_status: number | null, error: string | null, truncated: boolean, started_at: string, ttft_ms: number | null, latency_ms: number, request_bytes: number, response_bytes: number, };
+url: string, started_at: string, status: number | null, end: ExchangeEnd | null, truncated: boolean, frame_count: number, 
+/**
+ * Bytes of frame data.
+ */
+bytes: number, };
 
-export type StoredCall = { request: string, response: RawResponse | null, 
+export type StoredExchange = { id: string, service: string, environment: string, operation: string, session_id: string | null, metadata: Record<string, string>, transport: Transport, url: string, started_at: string, 
 /**
- * Position in the ingestion queue; increases with every stored record.
+ * Latest status reported by any segment.
  */
-seq: number, id: string, 
+status: number | null, 
 /**
- * When the server stored the record, RFC 3339.
+ * Number of stored segments.
  */
-received_at: string, service: string, environment: string, operation: string, session_id: string | null, metadata: Record<string, string>, 
+segments: number, 
 /**
- * Without query string and fragment.
+ * True once the final segment is stored and no segment is missing.
  */
-url: string, http_status: number | null, error: string | null, truncated: boolean, started_at: string, ttft_ms: number | null, latency_ms: number, request_bytes: number, response_bytes: number, };
+complete: boolean, truncated: boolean, 
+/**
+ * Frames of all segments in order.
+ */
+frames: Array<Frame>, end: ExchangeEnd | null, };
 
-export type ListCallsQuery = { service?: string, environment?: string, operation?: string, session_id?: string, 
+export type ListQuery = { service?: string, environment?: string, operation?: string, session_id?: string, transport?: Transport, 
 /**
- * True: only calls without a response, with status ≥ 400 or with a
- * client error. False: only the others.
+ * True: only final records of failed exchanges (end reason `error`, no
+ * status, or status ≥ 400). False: everything else.
  */
 failed?: boolean, from?: string, to?: string, 
 /**
@@ -137,15 +178,15 @@ limit?: number,
  */
 cursor?: string, };
 
-export type ListCallsResponse = { calls: Array<CallEnvelope>, 
+export type ListResponse = { entries: Array<LogEntry>, 
 /**
  * Pass as `cursor` to fetch the next page. `null` on the last page.
  */
 next_cursor: string | null, };
 
-export type Dimension = "service" | "environment" | "operation" | "session_id" | "http_status" | "day" | "hour";
+export type Dimension = "service" | "environment" | "operation" | "session_id" | "transport" | "status" | "day" | "hour";
 
-export type SummaryQuery = { service?: string, environment?: string, operation?: string, session_id?: string, failed?: boolean, from?: string, to?: string, 
+export type SummaryQuery = { service?: string, environment?: string, operation?: string, session_id?: string, transport?: Transport, failed?: boolean, from?: string, to?: string, 
 /**
  * Dimensions to group by, at most once each. Sent as a comma-separated
  * query parameter (`group_by=service,operation`). Empty means one total row.
@@ -158,13 +199,25 @@ limit?: number, };
 
 export type SummaryRow = { 
 /**
- * Value of each requested dimension. `null` when the calls lack it.
+ * Value of each requested dimension. `null` when the records lack it.
  */
-group: { [key in Dimension]?: string | null }, calls: number, 
+group: { [key in Dimension]?: string | null }, 
 /**
- * Calls without a response, with status ≥ 400 or with a client error.
+ * Distinct exchanges.
  */
-failed: number, request_bytes: number, response_bytes: number, latency_ms_avg: number | null, latency_ms_p95: number | null, latency_ms_p99: number | null, ttft_ms_p95: number | null, };
+exchanges: number, 
+/**
+ * Failed exchanges (final record with end reason `error`, no status or status ≥ 400).
+ */
+failed: number, 
+/**
+ * Stored records; more than `exchanges` when WebSocket sessions were segmented.
+ */
+records: number, frames: number, bytes: number, 
+/**
+ * Duration (`end.at_ms`) of finished exchanges.
+ */
+duration_ms_avg: number | null, duration_ms_p95: number | null, duration_ms_p99: number | null, };
 
 export type SummaryResponse = { rows: Array<SummaryRow>, 
 /**
@@ -182,24 +235,33 @@ export type ErrorCode = "invalid_request" | "unauthorized" | "not_found" | "meth
 
 export type ApiError = { error: ErrorCode, message: string, };
 
-export const DIMENSIONS: readonly Dimension[] = ["service", "environment", "operation", "session_id", "http_status", "day", "hour"];
+export const DIMENSIONS: readonly Dimension[] = ["service", "environment", "operation", "session_id", "transport", "status", "day", "hour"];
 
 export const ROUTES = {
     health: "/health",
-    ingestCalls: "/v1/calls",
-    listCalls: "/v1/calls",
-    getCall: "/v1/calls/{id}",
+    ingestWs: "/v1/ingest",
+    ingestHttp: "/v1/exchanges",
+    listExchanges: "/v1/exchanges",
+    getExchange: "/v1/exchanges/{id}",
     summary: "/v1/summary",
+} as const;
+
+export const PROTOCOLS = {
+    json: "ai-ledger.v1.json",
+    msgpack: "ai-ledger.v1.msgpack",
 } as const;
 
 export const LIMITS = {
     maxBatchSize: 500,
-    maxBodyBytes: 33554432,
+    maxBatchBytes: 33554432,
+    maxInFlightBatches: 4,
     maxIdLen: 128,
     maxNameLen: 256,
     maxUrlLen: 2048,
-    maxRequestBytes: 4194304,
-    maxResponseBytes: 4194304,
+    maxFrames: 10000,
+    maxFrameBytes: 4194304,
+    maxRecordBytes: 8388608,
+    maxSegment: 100000,
     maxErrorLen: 4000,
     maxMetadataEntries: 32,
     maxMetadataKeyLen: 64,

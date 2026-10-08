@@ -1,14 +1,19 @@
-// End-to-end: a mock AI provider, the collector in between, and the real Rust server.
+// End-to-end: a mock AI provider (JSON, SSE, WebSocket), the recorder in
+// between, and the real Rust server over the ingestion WebSocket.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, streamText } from "ai";
 import {
-    AiLedgerError,
     createLedger,
     LIMITS,
-    prepareRequest,
+    type Ledger,
+    type LedgerOptions,
+    prepareData,
     QueryClient,
+    type SocketFactory,
+    SseSplitter,
+    type StoredExchange,
     splitEvents,
     toSearch,
     UNATTRIBUTED,
@@ -19,18 +24,24 @@ const ingestToken = "ingest-token-0123456789";
 const queryToken = "query-token-0123456789";
 const ingestPort = 20_000 + Math.floor(Math.random() * 20_000);
 const queryPort = ingestPort + 1;
+const ingestUrl = `http://127.0.0.1:${ingestPort}`;
 let server: ReturnType<typeof Bun.spawn> | undefined;
 
 const query = new QueryClient({ baseUrl: `http://127.0.0.1:${queryPort}`, token: queryToken });
 const errors: unknown[] = [];
-const ledger = createLedger({
-    ingestUrl: `http://127.0.0.1:${ingestPort}/`,
-    token: ingestToken,
-    service: "test-service",
-    environment: "test",
-    flushIntervalMs: 60_000,
-    onError: (error) => errors.push(error),
-});
+
+function makeLedger(overrides: Partial<LedgerOptions> = {}): Ledger {
+    return createLedger({
+        ingestUrl,
+        token: ingestToken,
+        service: "test-service",
+        environment: "test",
+        flushIntervalMs: 60_000,
+        onError: (error) => errors.push(error),
+        ...overrides,
+    });
+}
+const ledger = makeLedger();
 
 const SSE_EVENTS = [
     'data: {"choices":[{"delta":{"content":"Hal"}}]}',
@@ -38,19 +49,34 @@ const SSE_EVENTS = [
     "data: [DONE]",
 ];
 
-// A fake provider: JSON for normal requests, SSE when `stream` is set, and a
-// slow endless stream for cancellation.
+// A fake provider: JSON, SSE (optionally slow or endless) and a realtime WebSocket.
 const provider = Bun.serve({
     port: 0,
-    async fetch(request) {
-        const body = (await request.json()) as { stream?: boolean; endless?: boolean; model?: string };
+    async fetch(request, srv) {
+        if (new URL(request.url).pathname === "/realtime") {
+            return srv.upgrade(request) ? undefined : new Response("upgrade failed", { status: 400 });
+        }
+        const body = (await request.json()) as {
+            stream?: boolean;
+            endless?: boolean;
+            slow?: boolean;
+            many?: number;
+            model?: string;
+        };
+        if (body.many !== undefined) {
+            const events = Array.from({ length: body.many }, (_, n) => `data: {"n":${n}}\n\n`).join("");
+            return new Response(`${events}data: {"usage":{"prompt_tokens":9}}\n\ndata: [DONE]\n\n`, {
+                headers: { "content-type": "text/event-stream" },
+            });
+        }
         if (body.model === "sdk-model") return openAiResponse(body.stream === true);
-        if (body.endless) {
+        if (body.endless || body.slow) {
             let index = 0;
             return new Response(
                 new ReadableStream({
                     async pull(controller) {
-                        await Bun.sleep(5);
+                        await Bun.sleep(body.slow ? 60 : 5);
+                        if (body.slow && index === 3) return controller.close();
                         controller.enqueue(new TextEncoder().encode(`data: {"n":${index++}}\n\n`));
                     },
                 }),
@@ -62,30 +88,37 @@ const provider = Bun.serve({
                 headers: { "content-type": "text/event-stream; charset=utf-8" },
             });
         }
-        return Response.json({ choices: [{ message: { role: "assistant", content: "Hallo" } }] }, { status: 200 });
+        return Response.json({ choices: [{ message: { role: "assistant", content: "Hallo" } }] });
+    },
+    websocket: {
+        message(ws, message) {
+            if (typeof message !== "string") {
+                ws.send(new Uint8Array(32));
+                return;
+            }
+            const event = JSON.parse(message) as { type: string };
+            ws.send(JSON.stringify({ type: "transcript.delta", delta: `got ${event.type}` }));
+            if (event.type === "bye") ws.close(1000, "done");
+        },
     },
 });
 const providerUrl = `http://127.0.0.1:${provider.port}/api/v1/chat/completions`;
 
 function openAiResponse(stream: boolean): Response {
     const usage = { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 };
+    const base = { id: "gen-1", created: 0, model: "sdk-model" };
     if (!stream) {
         return Response.json({
-            id: "gen-1",
+            ...base,
             object: "chat.completion",
-            created: 0,
-            model: "sdk-model",
             choices: [{ index: 0, message: { role: "assistant", content: "Hallo" }, finish_reason: "stop" }],
             usage,
         });
     }
-    const chunk = (delta: object, extra: object = {}) =>
-        `data: ${JSON.stringify({ id: "gen-2", object: "chat.completion.chunk", created: 0, model: "sdk-model", choices: [{ index: 0, delta, finish_reason: null }], ...extra })}\n\n`;
+    const chunk = (delta: object, finish: string | null = null, extra: object = {}) =>
+        `data: ${JSON.stringify({ ...base, object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: finish }], ...extra })}\n\n`;
     const body =
-        chunk({ role: "assistant", content: "Hal" }) +
-        chunk({ content: "lo" }) +
-        `data: ${JSON.stringify({ id: "gen-2", object: "chat.completion.chunk", created: 0, model: "sdk-model", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage })}\n\n` +
-        "data: [DONE]\n\n";
+        chunk({ role: "assistant", content: "Hal" }) + chunk({ content: "lo" }) + chunk({}, "stop", { usage }) + "data: [DONE]\n\n";
     return new Response(body, { headers: { "content-type": "text/event-stream" } });
 }
 
@@ -125,47 +158,51 @@ afterAll(async () => {
 const recorded = ledger.fetch();
 
 /** Waits for background reads to finish, then sends everything. */
-async function settle(): Promise<void> {
-    await Bun.sleep(20);
-    await ledger.flush();
+async function settle(target: Ledger = ledger): Promise<void> {
+    await Bun.sleep(30);
+    await target.flush();
 }
 
-async function onlyCall(operation: string) {
-    const page = await query.listCalls({ operation });
-    expect(page.calls).toHaveLength(1);
-    const call = await query.getCall(page.calls[0]?.id ?? "");
-    expect(call).not.toBeNull();
-    return call!;
+async function only(operation: string): Promise<StoredExchange> {
+    const page = await query.list({ operation });
+    const ids = new Set(page.entries.map((entry) => entry.id));
+    expect(ids.size).toBe(1);
+    const exchange = await query.getExchange([...ids][0] ?? "");
+    expect(exchange).not.toBeNull();
+    return exchange!;
 }
 
-test("records a JSON call with its operation context, verbatim", async () => {
+test("records a JSON call as an http exchange with its context", async () => {
     const requestBody = JSON.stringify({ model: "m", messages: [{ role: "user", content: "Hi" }] });
     const response = await ledger.operation(
         { operation: "listing.parse", sessionId: "s-1", metadata: { listing_id: "123" } },
         () => recorded(`${providerUrl}?key=secret`, { method: "POST", body: requestBody })
     );
-    // The caller gets the provider's response unchanged.
     expect(await response.json()).toEqual({ choices: [{ message: { role: "assistant", content: "Hallo" } }] });
     await settle();
 
-    const call = await onlyCall("listing.parse");
-    // The query string is removed before the record leaves the process.
-    expect(call).toMatchObject({
+    const exchange = await only("listing.parse");
+    expect(exchange).toMatchObject({
         service: "test-service",
         environment: "test",
         session_id: "s-1",
         metadata: { listing_id: "123" },
+        transport: "http",
         url: providerUrl,
-        request: requestBody,
-        response: JSON.stringify({ choices: [{ message: { role: "assistant", content: "Hallo" } }] }),
-        http_status: 200,
-        error: null,
+        status: 200,
+        segments: 1,
+        complete: true,
         truncated: false,
-        ttft_ms: null,
+        end: { reason: "complete" },
     });
+    expect(exchange.frames.map((frame) => [frame.dir, frame.data])).toEqual([
+        ["out", requestBody],
+        ["in", JSON.stringify({ choices: [{ message: { role: "assistant", content: "Hallo" } }] })],
+    ]);
+    expect(exchange.frames[0]?.t_ms).toBe(0);
 });
 
-test("passes a stream through unchanged and records its events", async () => {
+test("records a stream as sse frames and passes it through unchanged", async () => {
     const response = await ledger.operation({ operation: "support.chat" }, () =>
         recorded(providerUrl, { method: "POST", body: JSON.stringify({ stream: true }) })
     );
@@ -173,13 +210,27 @@ test("passes a stream through unchanged and records its events", async () => {
     expect(await response.text()).toBe(SSE_EVENTS.map((event) => `${event}\n\n`).join(""));
     await settle();
 
-    const call = await onlyCall("support.chat");
-    expect(call.response).toEqual(SSE_EVENTS);
-    expect(call.ttft_ms).not.toBeNull();
-    expect(call.error).toBeNull();
+    const exchange = await only("support.chat");
+    expect(exchange.transport).toBe("sse");
+    expect(exchange.frames.slice(1).map((frame) => frame.data)).toEqual(SSE_EVENTS);
+    expect(exchange.frames.slice(1).every((frame) => frame.dir === "in")).toBe(true);
 });
 
-test("records a cancelled stream with its partial events and stops the provider stream", async () => {
+test("stamps each event with the time it arrived", async () => {
+    await ledger.operation({ operation: "slow.stream" }, async () => {
+        await (await recorded(providerUrl, { method: "POST", body: JSON.stringify({ slow: true }) })).text();
+    });
+    await settle();
+
+    const exchange = await only("slow.stream");
+    const times = exchange.frames.slice(1).map((frame) => frame.t_ms);
+    expect(times).toHaveLength(3);
+    expect((times[1] ?? 0) - (times[0] ?? 0)).toBeGreaterThanOrEqual(40);
+    expect((times[2] ?? 0) - (times[1] ?? 0)).toBeGreaterThanOrEqual(40);
+    expect(exchange.end?.at_ms).toBeGreaterThanOrEqual(times[2] ?? 0);
+});
+
+test("records a cancelled stream with its partial events", async () => {
     const response = await ledger.operation({ operation: "cancelled.chat" }, () =>
         recorded(providerUrl, { method: "POST", body: JSON.stringify({ endless: true }) })
     );
@@ -189,10 +240,12 @@ test("records a cancelled stream with its partial events and stops the provider 
     await reader.cancel("user closed the chat");
     await settle();
 
-    const call = await onlyCall("cancelled.chat");
-    expect(call.error).toBe("CancelledError: stream cancelled by caller: user closed the chat");
-    expect((call.response as string[]).length).toBeGreaterThanOrEqual(2);
-    expect((call.response as string[])[0]).toBe('data: {"n":0}');
+    const exchange = await only("cancelled.chat");
+    expect(exchange.end).toMatchObject({
+        reason: "cancelled",
+        error: "CancelledError: stream cancelled by caller: user closed the chat",
+    });
+    expect(exchange.frames[1]?.data).toBe('data: {"n":0}');
 });
 
 test("records network failures and rethrows them to the caller", async () => {
@@ -202,10 +255,10 @@ test("records network failures and rethrows them to the caller", async () => {
     expect(failure).toBeInstanceOf(Error);
     await settle();
 
-    const call = await onlyCall("unreachable");
-    expect(call.http_status).toBeNull();
-    expect(call.response).toBeNull();
-    expect(call.error).toBeTruthy();
+    const exchange = await only("unreachable");
+    expect(exchange.status).toBeNull();
+    expect(exchange.frames.map((frame) => frame.dir)).toEqual(["out"]);
+    expect(exchange.end?.reason).toBe("error");
 });
 
 test("nested operations merge metadata; calls outside any operation are unattributed", async () => {
@@ -217,11 +270,10 @@ test("nested operations merge metadata; calls outside any operation are unattrib
     await (await recorded(new Request(providerUrl, { method: "POST", body: '{"x":1}' }))).text();
     await settle();
 
-    const inner = await onlyCall("inner.step");
+    const inner = await only("inner.step");
     expect(inner.session_id).toBe("s-2");
     expect(inner.metadata).toEqual({ a: "1", b: "2" });
-    const unattributed = await onlyCall(UNATTRIBUTED);
-    expect(unattributed.request).toBe('{"x":1}');
+    expect((await only(UNATTRIBUTED)).frames[0]?.data).toBe('{"x":1}');
 });
 
 test("works as the fetch of an AI SDK provider", async () => {
@@ -235,39 +287,71 @@ test("works as the fetch of an AI SDK provider", async () => {
         generateText({ model: sdk("sdk-model"), prompt: "Hi" })
     );
     expect(generated.text).toBe("Hallo");
-
     const streamed = await ledger.operation({ operation: "sdk.stream", sessionId: "chat-9" }, async () => {
-        const result = streamText({ model: sdk("sdk-model"), prompt: "Hi" });
-        return await result.text;
+        return await streamText({ model: sdk("sdk-model"), prompt: "Hi" }).text;
     });
     expect(streamed).toBe("Hallo");
     await settle();
 
-    const generate = await onlyCall("sdk.generate");
-    expect(JSON.parse(generate.request)).toMatchObject({ model: "sdk-model", messages: [{ role: "user", content: "Hi" }] });
-    expect(JSON.parse(generate.response as string).usage.prompt_tokens).toBe(7);
-
-    const stream = await onlyCall("sdk.stream");
-    expect(stream.session_id).toBe("chat-9");
-    expect(JSON.parse(stream.request)).toMatchObject({ stream: true, stream_options: { include_usage: true } });
-    const events = stream.response as string[];
-    expect(events.at(-1)).toBe("data: [DONE]");
-    expect(events.some((event) => event.includes('"prompt_tokens":7'))).toBe(true);
+    const generate = await only("sdk.generate");
+    expect(JSON.parse(generate.frames[0]?.data ?? "")).toMatchObject({ messages: [{ role: "user", content: "Hi" }] });
+    expect(JSON.parse(generate.frames[1]?.data ?? "").usage.prompt_tokens).toBe(7);
+    const stream = await only("sdk.stream");
+    expect(JSON.parse(stream.frames[0]?.data ?? "")).toMatchObject({ stream: true, stream_options: { include_usage: true } });
+    expect(stream.frames.at(-1)?.data).toBe("data: [DONE]");
 });
 
-test("summarises collected calls", async () => {
-    const summary = await query.summary({ group_by: ["service", "operation"], service: "test-service" });
-    const operations = summary.rows.map((row) => row.group.operation);
-    expect(operations).toContain("listing.parse");
-    expect(summary.rows.find((row) => row.group.operation === "unreachable")?.failed).toBe(1);
+test("records a provider WebSocket session in segments", async () => {
+    const segmented = makeLedger({ maxSegmentFrames: 3, encoding: "json" });
+    const audio = "A".repeat(4_000);
+    const ws = segmented.operation({ operation: "voice.interview", sessionId: "iv-1" }, () =>
+        segmented.socket(new WebSocket(`ws://127.0.0.1:${provider.port}/realtime?token=secret`))
+    );
+    await new Promise((resolve) => ws.addEventListener("open", resolve));
+    const closed = new Promise((resolve) => ws.addEventListener("close", resolve));
+    let replies = 0;
+    const replied = (count: number) =>
+        new Promise<void>((resolve) => {
+            const check = () => (replies >= count ? resolve() : setTimeout(check, 5));
+            check();
+        });
+    ws.addEventListener("message", () => replies++);
+    ws.send(JSON.stringify({ type: "session.update" }));
+    ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio }));
+    ws.send(new Uint8Array(16));
+    await replied(3);
+    ws.send(JSON.stringify({ type: "bye" }));
+    await closed;
+    await Bun.sleep(30);
+    await segmented.close();
 
-    const ids: string[] = [];
-    for await (const call of query.iterateCalls({ limit: 2 })) ids.push(call.id);
-    expect(ids.length).toBe(summary.rows.reduce((sum, row) => sum + row.calls, 0));
-    expect(await query.getCall("does/not exist")).toBeNull();
+    const exchange = await only("voice.interview");
+    expect(exchange).toMatchObject({
+        transport: "ws",
+        url: `ws://127.0.0.1:${provider.port}/realtime`,
+        status: 101,
+        session_id: "iv-1",
+        complete: true,
+        end: { reason: "closed", close_code: 1000 },
+    });
+    expect(exchange.segments).toBeGreaterThanOrEqual(3);
+    const data = exchange.frames.map((frame) => `${frame.dir} ${frame.data}`);
+    expect(data).toEqual([
+        // Wire order: all three sends go out before the first reply arrives.
+        'out {"type":"session.update"}',
+        'out {"type":"input_audio_buffer.append","audio":"[ai-ledger: omitted base64, 3000 bytes]"}',
+        "out [ai-ledger: unrecorded binary message, 16 bytes]",
+        'in {"type":"transcript.delta","delta":"got session.update"}',
+        'in {"type":"transcript.delta","delta":"got input_audio_buffer.append"}',
+        "in [ai-ledger: unrecorded binary message, 32 bytes]",
+        'out {"type":"bye"}',
+        'in {"type":"transcript.delta","delta":"got bye"}',
+    ]);
+    const times = exchange.frames.map((frame) => frame.t_ms);
+    expect([...times].sort((a, b) => a - b)).toEqual(times);
 });
 
-test("broken strings and invalid context are cleaned instead of losing the call", async () => {
+test("broken strings and invalid context are cleaned instead of losing the exchange", async () => {
     const cut = "😀".slice(0, 1); // a lone surrogate
     await ledger.operation(
         {
@@ -281,142 +365,238 @@ test("broken strings and invalid context are cleaned instead of losing the call"
     );
     await settle();
 
-    const call = await onlyCall("odd\uFFFD");
-    expect(call.truncated).toBe(true);
-    expect(call.session_id).toBeNull();
-    expect(call.metadata.ok).toBe("v\uFFFD");
-    expect(call.metadata["bad key"]).toBeUndefined();
-    expect(call.metadata.long?.length).toBe(LIMITS.maxMetadataValueLen);
-    expect(call.request).toBe('{"text":"\uFFFD"}');
+    const exchange = await only("odd\uFFFD");
+    expect(exchange.truncated).toBe(true);
+    expect(exchange.session_id).toBeNull();
+    expect(exchange.metadata.ok).toBe("v\uFFFD");
+    expect(exchange.metadata["bad key"]).toBeUndefined();
+    expect(exchange.metadata.long?.length).toBe(LIMITS.maxMetadataValueLen);
+    expect(exchange.frames[0]?.data).toBe('{"text":"\uFFFD"}');
     expect(ledger.stats().rejected).toBe(0);
 });
 
-test("server rejections, a throwing onError and an unreachable ledger never reach the caller", async () => {
-    const rejecting = createLedger({
-        ingestUrl: "http://ledger.invalid",
-        service: "s",
-        environment: "e",
-        flushIntervalMs: 60_000,
-        fetch: (async () =>
-            Response.json({ accepted: 0, duplicates: 0, rejected: [{ index: 0, reason: "nope" }] })) as unknown as typeof fetch,
+test("binary responses are not buffered; oversized text is clipped to the limits", async () => {
+    const audio = (async () =>
+        new Response(new Uint8Array(16), { headers: { "content-type": "audio/mpeg", "content-length": "16" } })) as unknown as typeof fetch;
+    const latin1 = (async () =>
+        new Response(new Uint8Array(LIMITS.maxFrameBytes).fill(0xe4), {
+            headers: { "content-type": "text/plain" },
+        })) as unknown as typeof fetch;
+    await ledger.operation({ operation: "speech" }, async () => {
+        const response = await ledger.fetch(audio)(`${providerUrl}/speech`, { method: "POST", body: "{}" });
+        expect((await response.arrayBuffer()).byteLength).toBe(16);
+    });
+    await ledger.operation({ operation: "latin1" }, async () => {
+        await (await ledger.fetch(latin1)(providerUrl, { method: "POST", body: "{}" })).arrayBuffer();
+    });
+    await settle();
+
+    expect((await only("speech")).frames[1]?.data).toBe("[ai-ledger: unrecorded audio/mpeg, 16 bytes]");
+    const clipped = await only("latin1");
+    expect(clipped.truncated).toBe(true);
+    expect(new TextEncoder().encode(clipped.frames[1]?.data).byteLength).toBeLessThanOrEqual(LIMITS.maxFrameBytes);
+});
+
+/** An in-memory ingestion socket that answers every batch with `reply`. */
+function fakeSocket(
+    reply: (batch: { id: number; exchanges: unknown[] }) => object | undefined,
+    options: { opens?: boolean; onSend?: () => void } = {}
+): SocketFactory {
+    return (_url, protocols) => {
+        const listeners = new Map<string, ((event: any) => void)[]>();
+        const emit = (type: string, event: object) => {
+            for (const listener of listeners.get(type) ?? []) listener(event);
+        };
+        const socket = {
+            protocol: protocols.includes("ai-ledger.v1.json") ? "ai-ledger.v1.json" : "",
+            binaryType: "blob",
+            send(data: string | Uint8Array) {
+                options.onSend?.();
+                const batch = JSON.parse(String(data));
+                const answer = reply(batch);
+                if (answer !== undefined) setTimeout(() => emit("message", { data: JSON.stringify(answer) }), 1);
+            },
+            close(code = 1000) {
+                setTimeout(() => emit("close", { code }), 1);
+            },
+            addEventListener(type: string, listener: (event: any) => void) {
+                listeners.set(type, [...(listeners.get(type) ?? []), listener]);
+            },
+        };
+        if (options.opens !== false) setTimeout(() => emit("open", {}), 1);
+        return socket;
+    };
+}
+
+test("server rejections and a throwing onError never reach the caller", async () => {
+    const rejecting = makeLedger({
+        encoding: "json",
+        socketFactory: fakeSocket((batch) => ({
+            type: "ack",
+            batch: batch.id,
+            accepted: 0,
+            duplicates: 0,
+            rejected: [{ index: 0, reason: "nope" }],
+        })),
         onError: () => {
             throw new Error("handler bug");
         },
     });
     await (await rejecting.fetch()(providerUrl, { method: "POST", body: "{}" })).text();
-    await Bun.sleep(20);
-    await rejecting.close(100);
+    await settle(rejecting);
+    await rejecting.close(200);
     expect(rejecting.stats()).toMatchObject({ rejected: 1, queued: 0 });
+});
 
-    const offline = createLedger({
-        ingestUrl: "http://127.0.0.1:1",
-        service: "s",
-        environment: "e",
-        flushIntervalMs: 60_000,
-        onError: () => {
-            throw new Error("handler bug");
-        },
-    });
+test("an unreachable ledger backs off and keeps the exchanges queued", async () => {
+    const offline = makeLedger({ ingestUrl: "http://127.0.0.1:1", onError: () => {} });
     const response = await offline.fetch()(providerUrl, { method: "POST", body: "{}" });
     expect(response.status).toBe(200);
     await response.text();
-    await Bun.sleep(20);
-    // Backs off after a failure instead of retrying on every call.
-    await offline.flush();
-    await offline.flush();
+    await settle(offline);
+    await offline.flush(); // backing off: returns at once
     expect(offline.stats()).toMatchObject({ queued: 1, failedSends: 1, sent: 0 });
+    const start = performance.now();
     await offline.close(1_500);
+    expect(performance.now() - start).toBeLessThan(2_500);
     expect(offline.stats().queued).toBe(1);
     expect(offline.stats().failedSends).toBeGreaterThanOrEqual(2);
 });
 
-test("close() honours its deadline against a ledger that never answers", async () => {
-    const hanging = Bun.serve({ port: 0, fetch: () => new Promise<Response>(() => {}) });
-    const stuck = createLedger({
-        ingestUrl: `http://127.0.0.1:${hanging.port}`,
-        service: "s",
-        environment: "e",
-        flushIntervalMs: 60_000,
-        onError: () => {},
-    });
-    await (await stuck.fetch()(providerUrl, { method: "POST", body: "{}" })).text();
+test("close() honours its deadline against a ledger that never acknowledges", async () => {
+    const silent = makeLedger({ encoding: "json", socketFactory: fakeSocket(() => undefined), onError: () => {} });
+    await (await silent.fetch()(providerUrl, { method: "POST", body: "{}" })).text();
     await Bun.sleep(20);
     const start = performance.now();
-    await stuck.close(300);
-    expect(performance.now() - start).toBeLessThan(1_500);
-    hanging.stop(true);
+    await silent.close(300);
+    expect(performance.now() - start).toBeLessThan(1_000);
+    expect(silent.stats().queued).toBe(1);
+    // Nothing is sent after close(); late records are counted as dropped.
+    await (await silent.fetch()(providerUrl, { method: "POST", body: "{}" })).text();
+    await Bun.sleep(30);
+    expect(silent.stats()).toMatchObject({ queued: 1, dropped: 1 });
 });
 
-test("responses that grow when decoded are clipped to the server limit", async () => {
-    const latin1 = (async () =>
-        new Response(new Uint8Array(2 * 1024 * 1024).fill(0xe4), {
-            headers: { "content-type": "text/plain" },
-        })) as unknown as typeof fetch;
-    await ledger.operation({ operation: "latin1" }, async () => {
-        await (await ledger.fetch(latin1)(providerUrl, { method: "POST", body: "{}" })).arrayBuffer();
+test("a server error backs off instead of resending in a loop", async () => {
+    let sends = 0;
+    const failing = makeLedger({
+        encoding: "json",
+        onError: () => {},
+        socketFactory: fakeSocket((batch) => ({ type: "error", batch: batch.id, error: "internal", message: "db down" }), {
+            onSend: () => sends++,
+        }),
+    });
+    await (await failing.fetch()(providerUrl, { method: "POST", body: "{}" })).text();
+    await settle(failing);
+    await Bun.sleep(300);
+    expect(sends).toBe(1);
+    expect(failing.stats()).toMatchObject({ queued: 1, failedSends: 1 });
+    await failing.close(100);
+});
+
+test("an error without a batch id settles the oldest batch", async () => {
+    const refusing = makeLedger({
+        encoding: "json",
+        onError: () => {},
+        socketFactory: fakeSocket(() => ({ type: "error", batch: null, error: "invalid_request", message: "bad" })),
+    });
+    await (await refusing.fetch()(providerUrl, { method: "POST", body: "{}" })).text();
+    await settle(refusing);
+    expect(refusing.stats()).toMatchObject({ queued: 0, dropped: 1 });
+    await refusing.close(100);
+});
+
+test("missing acks and hanging connects time out and back off", async () => {
+    for (const [name, socketFactory] of [
+        ["ack", fakeSocket(() => undefined)],
+        ["connect", fakeSocket(() => undefined, { opens: false })],
+    ] as const) {
+        const stuck = makeLedger({ encoding: "json", ackTimeoutMs: 100, connectTimeoutMs: 100, socketFactory, onError: () => {} });
+        await (await stuck.fetch()(providerUrl, { method: "POST", body: "{}" })).text();
+        await Bun.sleep(30);
+        const start = performance.now();
+        await stuck.flush();
+        expect(performance.now() - start, name).toBeLessThan(2_500);
+        expect(stuck.stats(), name).toMatchObject({ queued: 1, failedSends: 1 });
+        await stuck.close(50);
+    }
+});
+
+test("long streams keep their start and end", async () => {
+    await ledger.operation({ operation: "long.stream" }, async () => {
+        await (await recorded(providerUrl, { method: "POST", body: JSON.stringify({ many: 12_000 }) })).text();
     });
     await settle();
-    const call = await onlyCall("latin1");
-    expect(call.truncated).toBe(true);
-    expect(call.response_bytes).toBeLessThanOrEqual(LIMITS.maxResponseBytes);
-});
-
-test("binary responses are not buffered", async () => {
-    const binary = createLedger({
-        ingestUrl: `http://127.0.0.1:${ingestPort}`,
-        token: ingestToken,
-        service: "s",
-        environment: "e",
-        flushIntervalMs: 60_000,
-    });
-    const audio = (async () =>
-        new Response(new Uint8Array(16), {
-            headers: { "content-type": "audio/mpeg", "content-length": "16" },
-        })) as unknown as typeof fetch;
-    await binary.operation({ operation: "speech" }, async () => {
-        const response = await binary.fetch(audio)(`${providerUrl}/speech`, { method: "POST", body: "{}" });
-        expect((await response.arrayBuffer()).byteLength).toBe(16);
-    });
-    await Bun.sleep(20);
-    await binary.close();
-    const call = await onlyCall("speech");
-    expect(call.response).toBe("[ai-ledger: unrecorded audio/mpeg, 16 bytes]");
-});
-
-test("the wrong token is reported as a typed error", async () => {
-    const wrong = new QueryClient({ baseUrl: `http://127.0.0.1:${queryPort}`, token: ingestToken });
-    const error = await wrong.listCalls().catch((caught: unknown) => caught);
-    expect(error).toBeInstanceOf(AiLedgerError);
-    expect(error).toMatchObject({ status: 401, code: "unauthorized" });
-});
-
-test("splits SSE bodies into verbatim events", () => {
-    expect(splitEvents("event: a\ndata: 1\n\ndata: 2\r\n\r\n\n\n: ping\n\n")).toEqual([
-        "event: a\ndata: 1",
-        "data: 2",
-        ": ping",
+    const exchange = await only("long.stream");
+    expect(exchange.truncated).toBe(true);
+    expect(exchange.frames.length).toBeLessThanOrEqual(LIMITS.maxFrames);
+    expect(exchange.frames[1]?.data).toBe('data: {"n":0}');
+    expect(exchange.frames.some((frame) => /^\[ai-ledger: omitted \d+ events/.test(frame.data))).toBe(true);
+    expect(exchange.frames.slice(-2).map((frame) => frame.data)).toEqual([
+        'data: {"usage":{"prompt_tokens":9}}',
+        "data: [DONE]",
     ]);
-    expect(splitEvents("")).toEqual([]);
 });
 
-test("replaces inline base64 data and clips oversized requests", () => {
-    const image = `data:image/png;base64,${"A".repeat(4000)}`;
-    const prepared = prepareRequest(JSON.stringify({ messages: [{ content: [{ image_url: { url: image } }] }] }));
-    expect(prepared.truncated).toBe(false);
-    expect(prepared.text).toBe(
-        JSON.stringify({ messages: [{ content: [{ image_url: { url: "[ai-ledger: omitted image/png data, 3000 bytes]" } }] }] })
-    );
-    expect(prepareRequest("short;base64,not json").text).toBe("short;base64,not json");
+test("socket recording keeps send arguments and handles late attachment", async () => {
+    let callback = false;
+    const fake = {
+        url: "wss://api.example.com/v1/realtime",
+        readyState: 1,
+        send(_data: unknown, _options?: unknown, cb?: () => void) {
+            cb?.();
+        },
+        addEventListener() {},
+    };
+    ledger.socket(fake).send("{}", { binary: false }, () => {
+        callback = true;
+    });
+    expect(callback).toBe(true);
 
-    const huge = prepareRequest("ä".repeat(LIMITS.maxRequestBytes));
-    expect(huge.truncated).toBe(true);
-    expect(new TextEncoder().encode(huge.text).byteLength).toBeLessThanOrEqual(LIMITS.maxRequestBytes);
+    ledger.operation({ operation: "late.socket" }, () =>
+        ledger.socket({ ...fake, url: "wss://api.example.com/late", readyState: 3 })
+    );
+    await settle();
+    const late = await only("late.socket");
+    expect(late).toMatchObject({ transport: "ws", complete: true, frames: [], end: { reason: "closed" } });
+});
+
+test("summarises collected exchanges", async () => {
+    const summary = await query.summary({ group_by: ["transport"], service: "test-service" });
+    const transports = Object.fromEntries(summary.rows.map((row) => [row.group.transport, row]));
+    expect(Object.keys(transports).sort()).toEqual(["http", "sse", "ws"]);
+    expect(transports.ws?.records).toBeGreaterThan(transports.ws?.exchanges ?? 0);
+    const failed = await query.summary({ operation: "unreachable" });
+    expect(failed.rows[0]?.failed).toBe(1);
+    expect(await query.getExchange("does/not exist")).toBeNull();
+});
+
+test("splits SSE text into events across chunk boundaries", () => {
+    expect(splitEvents("event: a\ndata: 1\n\ndata: 2\r\n\r\n\n\n: ping\n\n")).toEqual(["event: a\ndata: 1", "data: 2", ": ping"]);
+    const splitter = new SseSplitter();
+    expect(splitter.push("data: 1\r")).toEqual([]);
+    expect(splitter.push("\n\r")).toEqual([]);
+    expect(splitter.push("\ndata: 2")).toEqual(["data: 1"]);
+    expect(splitter.end()).toEqual(["data: 2"]);
+    const boundary = new SseSplitter();
+    expect(boundary.push("data: 1\n\n")).toEqual(["data: 1"]);
+    expect(boundary.push("\ndata: 2\n")).toEqual([]);
+    expect(boundary.push("\n")).toEqual(["data: 2"]);
+});
+
+test("replaces inline base64 payloads but keeps everything else", () => {
+    const image = `data:image/png;base64,${"A".repeat(4000)}`;
+    expect(prepareData(JSON.stringify({ image_url: { url: image } }))).toBe(
+        JSON.stringify({ image_url: { url: "[ai-ledger: omitted image/png data, 3000 bytes]" } })
+    );
+    expect(prepareData(`{"audio":"${"B".repeat(1024)}"}`)).toBe('{"audio":"[ai-ledger: omitted base64, 768 bytes]"}');
+    const short = `{"id":"${"C".repeat(1023)}","n":12345678901234567890}`;
+    expect(prepareData(short)).toBe(short);
 });
 
 test("encodes queries like the server expects", () => {
     expect(toSearch({})).toBe("");
-    expect(toSearch({ group_by: [] })).toBe("");
-    expect(toSearch({ group_by: ["operation", "day"], limit: 5, failed: true })).toBe(
-        "?group_by=operation%2Cday&limit=5&failed=true"
+    expect(toSearch({ group_by: ["operation", "day"], limit: 5, failed: true, transport: "ws" })).toBe(
+        "?group_by=operation%2Cday&limit=5&failed=true&transport=ws"
     );
 });

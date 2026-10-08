@@ -1,6 +1,8 @@
-//! The ai-ledger server: a DuckDB-backed ledger of AI calls with separate
-//! ingestion and query HTTP APIs. The wire contract lives in `ai-ledger-api`.
+//! The ai-ledger server: a DuckDB raw log of AI provider exchanges, with a
+//! WebSocket ingestion API (JSON or MessagePack) and a separate read-only
+//! query API. The wire contract lives in `ai-ledger-api`.
 
 pub mod config;
 pub mod http;
+pub mod ingest;
 pub mod store;

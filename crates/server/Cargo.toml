@@ -1,19 +1,20 @@
 [package]
 name = "ai-ledger-server"
-description = "Standalone AI call ledger: DuckDB storage with separate ingestion and query HTTP APIs."
+description = "Standalone AI exchange ledger: DuckDB raw log with a WebSocket ingestion API and a separate query API."
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
 ai-ledger-api.workspace = true
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 chrono.workspace = true
 duckdb = { version = "1", features = ["bundled"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
+rmp-serde = "1"
+rmpv = { version = "1", features = ["with-serde"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["decompression-gzip", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -21,4 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [dev-dependencies]
 flate2 = "1"
 http-body-util = "0.1"
-tower = { version = "0.5", features = ["limit", "util"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tokio = { version = "1", features = ["io-util"] }
+tokio-tungstenite = "0.29"
+tower = { version = "0.5", features = ["util"] }

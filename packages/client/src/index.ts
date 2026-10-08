@@ -1,13 +1,14 @@
 export type * from "@traumwohnung/ai-ledger-api";
-export { DIMENSIONS, LIMITS, ROUTES } from "@traumwohnung/ai-ledger-api";
+export { DIMENSIONS, LIMITS, PROTOCOLS, ROUTES } from "@traumwohnung/ai-ledger-api";
 export {
     createLedger,
     type Ledger,
     type LedgerOptions,
     type LedgerStats,
     type OperationContext,
-    prepareRequest,
-    splitEvents,
+    type RecordableSocket,
     UNATTRIBUTED,
 } from "./ledger.ts";
-export { AiLedgerError, type ClientOptions, IngestClient, QueryClient, toSearch } from "./transport.ts";
+export { defaultSocketFactory, type Encoding, type IngestSocket, type SocketFactory } from "./sender.ts";
+export { prepareData, SseSplitter, splitEvents } from "./text.ts";
+export { AiLedgerError, type ClientOptions, QueryClient, toSearch } from "./transport.ts";

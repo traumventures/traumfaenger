@@ -1,67 +1,77 @@
-//! The two HTTP APIs. They share the store but nothing else: separate routers,
+//! The two APIs. They share the store but nothing else: separate routers,
 //! separate listeners and separate bearer tokens.
+//!
+//! Ingestion: a WebSocket (`GET /v1/ingest`, subprotocol JSON or MessagePack)
+//! for streaming batches with in-order acks, and `POST /v1/exchanges` for one
+//! JSON batch per request.
 
 use std::sync::Arc;
 
 use ai_ledger_api::{
-    ApiError, CallRecord, ErrorCode, HealthResponse, IngestResponse, ListCallsQuery, RejectedCall, SummaryQuery,
-    limits, routes,
+    ApiError, ErrorCode, HealthResponse, ListQuery, ServerMessage, SummaryQuery, limits, protocols, routes,
 };
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{
         DefaultBodyLimit, Path, Query, Request, State,
-        rejection::{JsonRejection, PathRejection, QueryRejection},
+        rejection::{BytesRejection, PathRejection, QueryRejection},
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::Utc;
-use serde::Deserialize;
-use tower::limit::GlobalConcurrencyLimitLayer;
+use tokio::sync::Semaphore;
 use tower_http::{decompression::RequestDecompressionLayer, trace::TraceLayer};
 
-use crate::store::{Store, StoreError};
+use crate::{
+    ingest::{self, BatchError, Encoding},
+    store::{Store, StoreError},
+};
 
 type SharedStore = Arc<Store>;
 
-/// Ingestion requests processed at once. Each can hold up to
-/// `limits::MAX_BODY_BYTES` decompressed plus its parsed records in memory;
-/// further requests wait.
-const MAX_CONCURRENT_INGESTS: usize = 4;
-
-/// Write-only API: `POST /v1/calls`. Accepts gzip-compressed bodies; the
-/// body limit applies after decompression.
-pub fn ingest_router(store: SharedStore, token: Option<String>) -> Router {
-    let api = Router::new()
-        .route(routes::INGEST_CALLS, post(ingest_calls))
-        .layer(DefaultBodyLimit::max(limits::MAX_BODY_BYTES))
-        .layer(RequestDecompressionLayer::new())
-        .layer(GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_INGESTS))
-        .route_layer(middleware::from_fn_with_state(Arc::new(token), require_bearer));
-    finish(api, "ingest", store)
+#[derive(Clone)]
+struct IngestState {
+    store: SharedStore,
+    /// Batches decoded and stored at once, across all connections. Each can
+    /// hold up to `limits::MAX_BATCH_BYTES` plus its decoded records.
+    permits: Arc<Semaphore>,
 }
 
-/// Read-only API: list, fetch and summarise collected calls.
+/// Write-only API.
+pub fn ingest_router(store: SharedStore, token: Option<String>) -> Router {
+    let state = IngestState { store, permits: Arc::new(Semaphore::new(limits::MAX_IN_FLIGHT_BATCHES)) };
+    let api = Router::new()
+        .route(routes::INGEST_WS, get(ingest_socket))
+        .route(routes::INGEST_HTTP, post(ingest_http))
+        .layer(DefaultBodyLimit::max(limits::MAX_BATCH_BYTES))
+        .layer(RequestDecompressionLayer::new())
+        .route_layer(middleware::from_fn_with_state(Arc::new(token), require_bearer))
+        .with_state(state);
+    finish(api, "ingest")
+}
+
+/// Read-only API: list the raw log, fetch exchanges, summarise.
 pub fn query_router(store: SharedStore, token: Option<String>) -> Router {
     let api = Router::new()
-        .route(routes::LIST_CALLS, get(list_calls))
-        .route(routes::GET_CALL, get(get_call))
+        .route(routes::LIST_EXCHANGES, get(list))
+        .route(routes::GET_EXCHANGE, get(get_exchange))
         .route(routes::SUMMARY, get(summary))
-        .route_layer(middleware::from_fn_with_state(Arc::new(token), require_bearer));
-    finish(api, "query", store)
+        .route_layer(middleware::from_fn_with_state(Arc::new(token), require_bearer))
+        .with_state(store);
+    finish(api, "query")
 }
 
-fn finish(api: Router<SharedStore>, name: &'static str, store: SharedStore) -> Router {
+fn finish(api: Router, name: &'static str) -> Router {
     api.route(routes::HEALTH, get(move || health(name)))
         .fallback(|| async { error(ErrorCode::NotFound, "no such route") })
         .method_not_allowed_fallback(|| async {
             error(ErrorCode::MethodNotAllowed, "method not allowed on this route")
         })
         .layer(TraceLayer::new_for_http())
-        .with_state(store)
 }
 
 async fn health(api: &'static str) -> Json<HealthResponse> {
@@ -89,72 +99,111 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// The ingestion body with records left unparsed, so one malformed record
-/// (wrong shape, invalid escape such as a lone surrogate) is rejected on its
-/// own instead of failing the whole batch.
-#[derive(Deserialize)]
-struct RawIngestRequest {
-    calls: Vec<Box<serde_json::value::RawValue>>,
+async fn ingest_socket(State(state): State<IngestState>, upgrade: WebSocketUpgrade) -> Response {
+    let offered: Vec<String> = upgrade
+        .requested_protocols()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(',').map(|protocol| protocol.trim().to_owned()).collect::<Vec<_>>())
+        .collect();
+    let Some(encoding) = Encoding::negotiate(offered.iter().map(String::as_str)) else {
+        return error(
+            ErrorCode::InvalidRequest,
+            format!("offer the subprotocol `{}` or `{}`", protocols::MSGPACK, protocols::JSON),
+        );
+    };
+    upgrade
+        .protocols([encoding.protocol()])
+        .max_message_size(limits::MAX_BATCH_BYTES)
+        .max_frame_size(limits::MAX_BATCH_BYTES)
+        .on_upgrade(move |socket| serve_socket(socket, state, encoding))
 }
 
-async fn ingest_calls(
-    State(store): State<SharedStore>,
-    body: Result<Json<RawIngestRequest>, JsonRejection>,
-) -> Response {
-    let Json(request) = match body {
+/// Handles one batch after another, so acks come back in the order the
+/// batches were sent; the socket is not read while a batch is processed.
+async fn serve_socket(mut socket: WebSocket, state: IngestState, encoding: Encoding) {
+    while let Some(Ok(message)) = socket.recv().await {
+        let bytes = match (encoding, message) {
+            (Encoding::Json, Message::Text(text)) => Bytes::from(text),
+            (Encoding::Msgpack, Message::Binary(bytes)) => bytes,
+            (_, Message::Close(_)) => break,
+            (_, Message::Ping(_) | Message::Pong(_)) => continue,
+            (_, _) => {
+                let kind = if encoding == Encoding::Json { "text" } else { "binary" };
+                let reply = BatchError {
+                    batch: None,
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("this protocol uses {kind} messages"),
+                };
+                if send(&mut socket, encoding, &reply.into_message()).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+        let reply = run_batch(&state, move |store| {
+            let batch = ingest::decode(encoding, &bytes)?;
+            let id = batch.id;
+            ingest::store(store, Some(id), batch.records).map(|result| ServerMessage::Ack { batch: id, result })
+        })
+        .await
+        .unwrap_or_else(BatchError::into_message);
+        if send(&mut socket, encoding, &reply).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn send(socket: &mut WebSocket, encoding: Encoding, message: &ServerMessage) -> Result<(), axum::Error> {
+    let bytes = encoding.encode(message);
+    let message = match encoding {
+        Encoding::Json => Message::Text(String::from_utf8(bytes).unwrap_or_default().into()),
+        Encoding::Msgpack => Message::Binary(bytes.into()),
+    };
+    socket.send(message).await
+}
+
+/// Runs batch work on a blocking thread, at most `MAX_IN_FLIGHT_BATCHES` at once.
+async fn run_batch<T: Send + 'static>(
+    state: &IngestState,
+    work: impl FnOnce(&Store) -> Result<T, BatchError> + Send + 'static,
+) -> Result<T, BatchError> {
+    let internal = || BatchError { batch: None, code: ErrorCode::Internal, message: "internal error".into() };
+    let Ok(_permit) = state.permits.clone().acquire_owned().await else { return Err(internal()) };
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || work(&store)).await.unwrap_or_else(|join_error| {
+        tracing::error!(error = %join_error, "ingest task panicked");
+        Err(internal())
+    })
+}
+
+async fn ingest_http(State(state): State<IngestState>, body: Result<Bytes, BytesRejection>) -> Response {
+    let body = match body {
         Ok(body) => body,
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-            return error(ErrorCode::PayloadTooLarge, format!("body exceeds {} bytes", limits::MAX_BODY_BYTES));
+            return error(ErrorCode::PayloadTooLarge, format!("body exceeds {} bytes", limits::MAX_BATCH_BYTES));
         }
         Err(rejection) => return error(ErrorCode::InvalidRequest, rejection.body_text()),
     };
-    if request.calls.is_empty() || request.calls.len() > limits::MAX_BATCH_SIZE {
-        return error(
-            ErrorCode::InvalidRequest,
-            format!("`calls` must contain 1 to {} records", limits::MAX_BATCH_SIZE),
-        );
+    match run_batch(&state, move |store| ingest::store(store, None, ingest::decode_http(&body)?)).await {
+        Ok(result) => Json(result).into_response(),
+        Err(failure) => error(failure.code, failure.message),
     }
-
-    let mut valid = Vec::with_capacity(request.calls.len());
-    let mut rejected = Vec::new();
-    for (index, value) in request.calls.into_iter().enumerate() {
-        let record = serde_json::from_str::<CallRecord>(value.get())
-            .map_err(|parse_error| parse_error.to_string())
-            .and_then(|record| record.validate().map(|()| record));
-        match record {
-            Ok(record) => valid.push(record),
-            Err(reason) => rejected.push(RejectedCall { index: index as u32, reason }),
-        }
-    }
-    if !rejected.is_empty() {
-        tracing::warn!(rejected = rejected.len(), first = %rejected[0].reason, "rejected call records");
-    }
-
-    let received_at = Utc::now();
-    run(store, move |store| -> Result<_, HandlerError> {
-        let inserted = if valid.is_empty() { Default::default() } else { store.insert(&valid, received_at)? };
-        Ok(IngestResponse { accepted: inserted.accepted as u32, duplicates: inserted.duplicates as u32, rejected })
-    })
-    .await
 }
 
-async fn list_calls(
-    State(store): State<SharedStore>,
-    query: Result<Query<ListCallsQuery>, QueryRejection>,
-) -> Response {
+async fn list(State(store): State<SharedStore>, query: Result<Query<ListQuery>, QueryRejection>) -> Response {
     match query {
         Ok(Query(query)) => run(store, move |store| store.list(&query)).await,
         Err(rejection) => error(ErrorCode::InvalidRequest, rejection.body_text()),
     }
 }
 
-async fn get_call(State(store): State<SharedStore>, id: Result<Path<String>, PathRejection>) -> Response {
+async fn get_exchange(State(store): State<SharedStore>, id: Result<Path<String>, PathRejection>) -> Response {
     let Ok(Path(id)) = id else {
-        return error(ErrorCode::InvalidRequest, "invalid call id in path");
+        return error(ErrorCode::InvalidRequest, "invalid exchange id in path");
     };
     run(store, move |store| -> Result<_, HandlerError> {
-        let call = store.get(&id)?;
-        call.ok_or(HandlerError::NotFound(id))
+        let exchange = store.get(&id)?;
+        exchange.ok_or(HandlerError::NotFound(id))
     })
     .await
 }
@@ -166,7 +215,7 @@ async fn summary(State(store): State<SharedStore>, query: Result<Query<SummaryQu
     }
 }
 
-/// Why a handler could not produce its value.
+/// Why a query handler could not produce its value.
 enum HandlerError {
     Store(StoreError),
     NotFound(String),
@@ -178,7 +227,7 @@ impl From<StoreError> for HandlerError {
     }
 }
 
-/// Runs a store operation on a blocking thread and maps the result to HTTP.
+/// Runs a store query on a blocking thread and maps the result to HTTP.
 async fn run<T, E>(store: SharedStore, operation: impl FnOnce(&Store) -> Result<T, E> + Send + 'static) -> Response
 where
     T: serde::Serialize + Send + 'static,
@@ -187,7 +236,7 @@ where
     match tokio::task::spawn_blocking(move || operation(&store)).await {
         Ok(Ok(value)) => Json(value).into_response(),
         Ok(Err(failure)) => match failure.into() {
-            HandlerError::NotFound(id) => error(ErrorCode::NotFound, format!("no call with id `{id}`")),
+            HandlerError::NotFound(id) => error(ErrorCode::NotFound, format!("no exchange with id `{id}`")),
             HandlerError::Store(StoreError::Invalid(message)) => error(ErrorCode::InvalidRequest, message),
             HandlerError::Store(failure) => {
                 tracing::error!(error = %failure, "store operation failed");
