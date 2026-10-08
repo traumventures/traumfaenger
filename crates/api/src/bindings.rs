@@ -5,8 +5,9 @@ use std::fmt::Write;
 use ts_rs::{Config, TS};
 
 use crate::{
-    AiCall, ApiError, CallStatus, Dimension, ErrorCode, HealthResponse, IngestRequest, IngestResponse, ListCallsQuery,
-    ListCallsResponse, NewAiCall, SummaryQuery, SummaryResponse, SummaryRow, limits, routes,
+    ApiError, CallEnvelope, CallRecord, Dimension, ErrorCode, HealthResponse, IngestRequest, IngestResponse,
+    ListCallsQuery, ListCallsResponse, RawResponse, RejectedCall, StoredCall, SummaryQuery, SummaryResponse,
+    SummaryRow, limits, routes,
 };
 
 /// The complete TypeScript module: every wire type plus `ROUTES` and `LIMITS`.
@@ -17,11 +18,13 @@ pub fn typescript_bindings() -> String {
     // Fixed defaults instead of `Config::from_env()`: output must not depend on the environment.
     let cfg = Config::new();
     for declaration in [
-        CallStatus::decl(&cfg),
-        NewAiCall::decl(&cfg),
-        AiCall::decl(&cfg),
+        RawResponse::decl(&cfg),
+        CallRecord::decl(&cfg),
         IngestRequest::decl(&cfg),
+        RejectedCall::decl(&cfg),
         IngestResponse::decl(&cfg),
+        CallEnvelope::decl(&cfg),
+        StoredCall::decl(&cfg),
         ListCallsQuery::decl(&cfg),
         ListCallsResponse::decl(&cfg),
         Dimension::decl(&cfg),
@@ -56,12 +59,15 @@ pub fn typescript_bindings() -> String {
         ("maxBatchSize", limits::MAX_BATCH_SIZE as u64),
         ("maxBodyBytes", limits::MAX_BODY_BYTES as u64),
         ("maxIdLen", limits::MAX_ID_LEN as u64),
-        ("maxTextLen", limits::MAX_TEXT_LEN as u64),
+        ("maxNameLen", limits::MAX_NAME_LEN as u64),
+        ("maxUrlLen", limits::MAX_URL_LEN as u64),
+        ("maxRequestBytes", limits::MAX_REQUEST_BYTES as u64),
+        ("maxResponseBytes", limits::MAX_RESPONSE_BYTES as u64),
         ("maxErrorLen", limits::MAX_ERROR_LEN as u64),
-        ("maxMetadataBytes", limits::MAX_METADATA_BYTES as u64),
-        ("maxCount", limits::MAX_COUNT),
-        ("maxAttempt", u64::from(limits::MAX_ATTEMPT)),
-        ("maxCostUsd", limits::MAX_COST_USD as u64),
+        ("maxMetadataEntries", limits::MAX_METADATA_ENTRIES as u64),
+        ("maxMetadataKeyLen", limits::MAX_METADATA_KEY_LEN as u64),
+        ("maxMetadataValueLen", limits::MAX_METADATA_VALUE_LEN as u64),
+        ("maxDurationMs", limits::MAX_DURATION_MS),
         ("defaultListLimit", u64::from(limits::DEFAULT_LIST_LIMIT)),
         ("maxListLimit", u64::from(limits::MAX_LIST_LIMIT)),
         ("defaultSummaryLimit", u64::from(limits::DEFAULT_SUMMARY_LIMIT)),

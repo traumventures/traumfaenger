@@ -13,6 +13,8 @@ pub struct Config {
     /// `None` only when authentication is explicitly disabled.
     pub ingest_token: Option<String>,
     pub query_token: Option<String>,
+    /// Delete raw records this many days after receipt. `None` keeps them.
+    pub retention_days: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -72,7 +74,20 @@ impl Config {
             (Some(ingest), Some(query))
         };
 
+        let retention_days = match lookup("AI_LEDGER_RETENTION_DAYS") {
+            None => None,
+            Some(value) => match value.parse::<u32>() {
+                Ok(days) if days > 0 => Some(days),
+                _ => {
+                    return Err(ConfigError(format!(
+                        "AI_LEDGER_RETENTION_DAYS must be a positive number of days, got `{value}`"
+                    )));
+                }
+            },
+        };
+
         Ok(Self {
+            retention_days,
             database: lookup("AI_LEDGER_DATABASE").unwrap_or_else(|| "ai-ledger.duckdb".to_owned()),
             memory_limit: lookup("AI_LEDGER_MEMORY_LIMIT"),
             ingest_addr,
@@ -116,5 +131,10 @@ mod tests {
         let open = config(&[("AI_LEDGER_AUTH", "disabled")]).unwrap();
         assert!(open.ingest_token.is_none() && open.query_token.is_none());
         assert!(config(&[("AI_LEDGER_AUTH", "off")]).is_err());
+
+        assert_eq!(open.retention_days, None);
+        let days = config(&[("AI_LEDGER_AUTH", "disabled"), ("AI_LEDGER_RETENTION_DAYS", "30")]).unwrap();
+        assert_eq!(days.retention_days, Some(30));
+        assert!(config(&[("AI_LEDGER_AUTH", "disabled"), ("AI_LEDGER_RETENTION_DAYS", "0")]).is_err());
     }
 }

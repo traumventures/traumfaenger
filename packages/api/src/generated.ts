@@ -1,101 +1,133 @@
 // Generated from crates/api by `cargo run -p ai-ledger-api --bin gen-ts`. Do not edit.
 
-export type CallStatus = "ok" | "error";
+export type RawResponse = string | Array<string>;
 
-export type NewAiCall = { 
+export type CallRecord = { 
 /**
- * Caller-generated unique id, for example a UUID. 1–128 bytes.
+ * Client-generated unique id, for example a UUID. 1–128 bytes.
  */
 id: string, 
 /**
- * When the call started, RFC 3339.
+ * The emitting service, for example `traumwohnung-web`.
  */
-occurred_at: string, 
+service: string, 
 /**
- * What the call was for, for example `listing.parse`.
+ * For example `production`, `dev` or `local`.
  */
-feature: string, 
+environment: string, 
 /**
- * Kind of the object the call worked on, for example `listing`.
+ * The kind of work, for example `listing.parse`.
  */
-entity_type?: string, 
+operation: string, 
 /**
- * Id of the object the call worked on.
+ * Groups the calls of one conversation, for example one support chat.
  */
-entity_id?: string, 
+session_id?: string, 
 /**
- * Groups calls that belong to one logical operation, for example retries.
+ * Flat key-value pairs, for example `{ "listing_id": "123" }`. At most 32
+ * entries; keys are 1–64 characters of `A-Z a-z 0-9 _ . -`.
  */
-trace_id?: string, 
+metadata?: Record<string, string>, 
 /**
- * Who served the call, for example `openrouter`.
+ * The request URL. The server drops query string and fragment.
  */
-provider: string, 
+url: string, 
 /**
- * Model identifier as reported by the provider.
+ * The request body exactly as sent.
  */
-model: string, reasoning_effort?: string, status: CallStatus, 
+request: string, 
 /**
- * Error message when `status` is `error`.
+ * The response as received. Absent when no response arrived.
+ */
+response?: RawResponse, 
+/**
+ * HTTP status of the response. Absent when no response arrived.
+ */
+http_status?: number, 
+/**
+ * Client-side exception, for example a network failure or an abort.
  */
 error?: string, 
 /**
- * 1-based attempt number within `trace_id`. Defaults to 1.
+ * True when the client changed anything to fit the limits: clipped
+ * `request` or `response`, or cleaned context (dropped invalid metadata
+ * entries, clipped values, an empty operation recorded as `unattributed`).
  */
-attempt?: number, 
+truncated?: boolean, 
 /**
- * Prompt tokens, including cached ones. Defaults to 0.
+ * When the request was sent, RFC 3339.
  */
-input_tokens?: number, 
+started_at: string, 
 /**
- * Completion tokens, including reasoning ones. Defaults to 0.
+ * Streaming calls only: time until the first response chunk, in milliseconds.
  */
-output_tokens?: number, 
+ttft_ms?: number, 
 /**
- * Subset of `input_tokens` served from the provider cache. Defaults to 0.
+ * Time until the response was complete (or failed), in milliseconds.
  */
-cached_input_tokens?: number, 
-/**
- * Subset of `output_tokens` spent on reasoning. Defaults to 0.
- */
-reasoning_tokens?: number, 
-/**
- * Cost billed by the provider in USD. Omit when unknown; never estimate.
- */
-cost_usd?: number, 
-/**
- * Wall-clock duration of the call in milliseconds.
- */
-latency_ms?: number, 
-/**
- * Free-form JSON object for anything else. At most 8 KiB.
- */
-metadata?: Record<string, unknown>, };
-
-export type AiCall = { id: string, occurred_at: string, 
-/**
- * When the ledger first accepted the call, RFC 3339.
- */
-received_at: string, feature: string, entity_type: string | null, entity_id: string | null, trace_id: string | null, provider: string, model: string, reasoning_effort: string | null, status: CallStatus, error: string | null, attempt: number, input_tokens: number, output_tokens: number, cached_input_tokens: number, reasoning_tokens: number, cost_usd: number | null, latency_ms: number | null, metadata: Record<string, unknown> | null, };
+latency_ms: number, };
 
 export type IngestRequest = { 
 /**
- * 1–1000 calls. The batch is validated as a whole: one invalid call
- * rejects the request and nothing is stored.
+ * 1–500 records. Each record is validated on its own: invalid records are
+ * reported in `rejected`, the valid ones are stored.
  */
-calls: Array<NewAiCall>, };
+calls: Array<CallRecord>, };
+
+export type RejectedCall = { 
+/**
+ * Position of the record in `calls`.
+ */
+index: number, reason: string, };
 
 export type IngestResponse = { 
 /**
- * Calls stored by this request.
+ * Records stored by this request.
  */
 accepted: number, 
 /**
- * Calls whose id was already stored, or repeated within the batch.
+ * Records whose id was already stored, or repeated within the request.
  */
-duplicates: number, };
+duplicates: number, 
+/**
+ * Records that failed validation. Retrying them will not succeed.
+ */
+rejected: Array<RejectedCall>, };
 
-export type ListCallsQuery = { feature?: string, entity_type?: string, entity_id?: string, trace_id?: string, provider?: string, model?: string, status?: CallStatus, from?: string, to?: string, 
+export type CallEnvelope = { 
+/**
+ * Position in the ingestion queue; increases with every stored record.
+ */
+seq: number, id: string, 
+/**
+ * When the server stored the record, RFC 3339.
+ */
+received_at: string, service: string, environment: string, operation: string, session_id: string | null, metadata: Record<string, string>, 
+/**
+ * Without query string and fragment.
+ */
+url: string, http_status: number | null, error: string | null, truncated: boolean, started_at: string, ttft_ms: number | null, latency_ms: number, request_bytes: number, response_bytes: number, };
+
+export type StoredCall = { request: string, response: RawResponse | null, 
+/**
+ * Position in the ingestion queue; increases with every stored record.
+ */
+seq: number, id: string, 
+/**
+ * When the server stored the record, RFC 3339.
+ */
+received_at: string, service: string, environment: string, operation: string, session_id: string | null, metadata: Record<string, string>, 
+/**
+ * Without query string and fragment.
+ */
+url: string, http_status: number | null, error: string | null, truncated: boolean, started_at: string, ttft_ms: number | null, latency_ms: number, request_bytes: number, response_bytes: number, };
+
+export type ListCallsQuery = { service?: string, environment?: string, operation?: string, session_id?: string, 
+/**
+ * True: only calls without a response, with status ≥ 400 or with a
+ * client error. False: only the others.
+ */
+failed?: boolean, from?: string, to?: string, 
 /**
  * Page size, 1–1000. Defaults to 100.
  */
@@ -105,18 +137,18 @@ limit?: number,
  */
 cursor?: string, };
 
-export type ListCallsResponse = { calls: Array<AiCall>, 
+export type ListCallsResponse = { calls: Array<CallEnvelope>, 
 /**
  * Pass as `cursor` to fetch the next page. `null` on the last page.
  */
 next_cursor: string | null, };
 
-export type Dimension = "feature" | "entity_type" | "entity_id" | "trace_id" | "provider" | "model" | "reasoning_effort" | "status" | "day" | "hour";
+export type Dimension = "service" | "environment" | "operation" | "session_id" | "http_status" | "day" | "hour";
 
-export type SummaryQuery = { feature?: string, entity_type?: string, entity_id?: string, trace_id?: string, provider?: string, model?: string, status?: CallStatus, from?: string, to?: string, 
+export type SummaryQuery = { service?: string, environment?: string, operation?: string, session_id?: string, failed?: boolean, from?: string, to?: string, 
 /**
  * Dimensions to group by, at most once each. Sent as a comma-separated
- * query parameter (`group_by=feature,model`). Empty means one total row.
+ * query parameter (`group_by=service,operation`). Empty means one total row.
  */
 group_by?: Array<Dimension>, 
 /**
@@ -128,19 +160,11 @@ export type SummaryRow = {
 /**
  * Value of each requested dimension. `null` when the calls lack it.
  */
-group: { [key in Dimension]?: string | null }, calls: number, errors: number, input_tokens: number, output_tokens: number, cached_input_tokens: number, reasoning_tokens: number, 
+group: { [key in Dimension]?: string | null }, calls: number, 
 /**
- * Sum of the known billed costs.
+ * Calls without a response, with status ≥ 400 or with a client error.
  */
-cost_usd: number, 
-/**
- * Calls without a billed cost; `cost_usd` excludes them.
- */
-calls_without_cost: number, 
-/**
- * Mean and 95th percentile of the known latencies.
- */
-latency_ms_avg: number | null, latency_ms_p95: number | null, };
+failed: number, request_bytes: number, response_bytes: number, latency_ms_avg: number | null, latency_ms_p95: number | null, latency_ms_p99: number | null, ttft_ms_p95: number | null, };
 
 export type SummaryResponse = { rows: Array<SummaryRow>, 
 /**
@@ -158,7 +182,7 @@ export type ErrorCode = "invalid_request" | "unauthorized" | "not_found" | "meth
 
 export type ApiError = { error: ErrorCode, message: string, };
 
-export const DIMENSIONS: readonly Dimension[] = ["feature", "entity_type", "entity_id", "trace_id", "provider", "model", "reasoning_effort", "status", "day", "hour"];
+export const DIMENSIONS: readonly Dimension[] = ["service", "environment", "operation", "session_id", "http_status", "day", "hour"];
 
 export const ROUTES = {
     health: "/health",
@@ -169,15 +193,18 @@ export const ROUTES = {
 } as const;
 
 export const LIMITS = {
-    maxBatchSize: 1000,
-    maxBodyBytes: 8388608,
+    maxBatchSize: 500,
+    maxBodyBytes: 33554432,
     maxIdLen: 128,
-    maxTextLen: 512,
+    maxNameLen: 256,
+    maxUrlLen: 2048,
+    maxRequestBytes: 4194304,
+    maxResponseBytes: 4194304,
     maxErrorLen: 4000,
-    maxMetadataBytes: 8192,
-    maxCount: 1000000000000,
-    maxAttempt: 1000,
-    maxCostUsd: 1000000,
+    maxMetadataEntries: 32,
+    maxMetadataKeyLen: 64,
+    maxMetadataValueLen: 512,
+    maxDurationMs: 86400000,
     defaultListLimit: 100,
     maxListLimit: 1000,
     defaultSummaryLimit: 1000,

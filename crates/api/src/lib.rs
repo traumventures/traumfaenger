@@ -1,17 +1,22 @@
 //! The ai-ledger wire contract.
 //!
-//! Every type that crosses the HTTP boundary is defined here once. The server
-//! uses these types directly; the TypeScript packages use the declarations that
-//! [`typescript_bindings`] generates from them, so both sides share one source
-//! of truth.
+//! ai-ledger collects AI model calls in two steps:
 //!
-//! The service exposes two independent HTTP APIs on separate listeners:
+//! 1. **Collection** (this crate today): clients record every provider call
+//!    as a [`CallRecord`] (the HTTP request and response exactly as they went
+//!    over the wire, plus context nothing in them contains) and send it to the
+//!    ingestion API. The server stores records unparsed in a queue table.
+//! 2. **Processing** (later): the server extracts models, usage, prices,
+//!    costs, messages and tool calls from the queued records into derived
+//!    tables. Because the raw records are kept, processing can be rerun when a
+//!    parser improves.
 //!
-//! - **Ingestion** (write-only): `POST /v1/calls` appends AI calls.
-//! - **Query** (read-only): list, fetch and summarise recorded calls.
+//! The service exposes two HTTP APIs on separate listeners with separate
+//! bearer tokens: **ingestion** (write-only) and **query** (read-only).
 //!
-//! Each API has its own bearer token, so an emitter can never read the ledger
-//! and a reader can never write to it.
+//! Every type that crosses the HTTP boundary is defined here once. The
+//! TypeScript packages use declarations generated from it by
+//! [`typescript_bindings`].
 
 use std::collections::BTreeMap;
 
@@ -27,36 +32,37 @@ pub use bindings::typescript_bindings;
 pub mod routes {
     /// `GET`, unauthenticated, on both listeners.
     pub const HEALTH: &str = "/health";
-    /// Ingestion listener: `POST` a batch of calls.
+    /// Ingestion listener: `POST` a batch of call records.
     pub const INGEST_CALLS: &str = "/v1/calls";
-    /// Query listener: `GET` a filtered, paginated list of calls.
+    /// Query listener: `GET` a filtered page of call envelopes, newest first.
     pub const LIST_CALLS: &str = "/v1/calls";
-    /// Query listener: `GET` one call by id. `{id}` is the path parameter.
+    /// Query listener: `GET` one call including request and response.
     pub const GET_CALL: &str = "/v1/calls/{id}";
-    /// Query listener: `GET` aggregated usage grouped by dimensions.
+    /// Query listener: `GET` collection statistics grouped by dimensions.
     pub const SUMMARY: &str = "/v1/summary";
 }
 
 /// Limits enforced by the server. Exported to TypeScript as `LIMITS`.
 pub mod limits {
-    /// Maximum number of calls in one ingestion request.
-    pub const MAX_BATCH_SIZE: usize = 1_000;
-    /// Maximum request body size of an ingestion request, in bytes.
-    pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+    /// Maximum number of records in one ingestion request.
+    pub const MAX_BATCH_SIZE: usize = 500;
+    /// Maximum size of one ingestion request body after gzip decompression.
+    pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
     /// Maximum length of `id`, in bytes.
     pub const MAX_ID_LEN: usize = 128;
-    /// Maximum length of every other string field except `error`, in bytes.
-    pub const MAX_TEXT_LEN: usize = 512;
-    /// Maximum length of `error`, in bytes. Longer messages are rejected.
+    /// Maximum length of `service`, `environment`, `operation` and `session_id`.
+    pub const MAX_NAME_LEN: usize = 256;
+    pub const MAX_URL_LEN: usize = 2_048;
+    /// Maximum size of `request`, in bytes.
+    pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+    /// Maximum size of `response`, in bytes (sum of all events for streams).
+    pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
     pub const MAX_ERROR_LEN: usize = 4_000;
-    /// Maximum size of `metadata` serialised as JSON, in bytes.
-    pub const MAX_METADATA_BYTES: usize = 8 * 1024;
-    /// Upper bound for every token count and for `latency_ms`.
-    pub const MAX_COUNT: u64 = 1_000_000_000_000;
-    /// Upper bound for `attempt`.
-    pub const MAX_ATTEMPT: u32 = 1_000;
-    /// Upper bound for `cost_usd` of one call, in USD.
-    pub const MAX_COST_USD: f64 = 1_000_000.0;
+    pub const MAX_METADATA_ENTRIES: usize = 32;
+    pub const MAX_METADATA_KEY_LEN: usize = 64;
+    pub const MAX_METADATA_VALUE_LEN: usize = 512;
+    /// Upper bound for `latency_ms` and `ttft_ms`: one day.
+    pub const MAX_DURATION_MS: u64 = 86_400_000;
     /// Default and maximum page size of `GET /v1/calls`.
     pub const DEFAULT_LIST_LIMIT: u32 = 100;
     pub const MAX_LIST_LIMIT: u32 = 1_000;
@@ -65,250 +71,270 @@ pub mod limits {
     pub const MAX_SUMMARY_LIMIT: u32 = 10_000;
 }
 
-/// Outcome of one AI call.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum CallStatus {
-    Ok,
-    Error,
-}
-
-impl CallStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Error => "error",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "ok" => Some(Self::Ok),
-            "error" => Some(Self::Error),
-            _ => None,
-        }
-    }
-}
-
-/// One AI call as sent to the ingestion API.
-///
-/// `id` is the idempotency key: re-sending a call with an id that already
-/// exists is accepted and counted as a duplicate, and the stored call is left
-/// unchanged (first write wins).
+/// The provider's response as received.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
-#[serde(deny_unknown_fields)]
-pub struct NewAiCall {
-    /// Caller-generated unique id, for example a UUID. 1–128 bytes.
+#[serde(untagged)]
+pub enum RawResponse {
+    /// The complete response body of a non-streaming call.
+    Body(String),
+    /// A streaming (SSE) response: one entry per event, verbatim (the text
+    /// between blank lines, including `event:` and `data:` lines).
+    Events(Vec<String>),
+}
+
+impl RawResponse {
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Self::Body(body) => body.len(),
+            Self::Events(events) => events.iter().map(String::len).sum(),
+        }
+    }
+}
+
+/// One AI provider call as recorded by a client.
+///
+/// Only what is not contained in the request or response is sent as a
+/// separate field. Provider, model, usage, finish reason, messages, tool calls
+/// and cost are extracted on the server from `url`, `request` and `response`.
+///
+/// `id` is the idempotency key: re-sending a record whose id is already stored
+/// is accepted, counted as a duplicate and leaves the stored record unchanged.
+///
+/// Unknown fields are ignored, so a newer client can talk to an older server.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+pub struct CallRecord {
+    /// Client-generated unique id, for example a UUID. 1–128 bytes.
     pub id: String,
-    /// When the call started, RFC 3339.
-    #[ts(type = "string")]
-    pub occurred_at: DateTime<Utc>,
-    /// What the call was for, for example `listing.parse`.
-    pub feature: String,
-    /// Kind of the object the call worked on, for example `listing`.
+    /// The emitting service, for example `traumwohnung-web`.
+    pub service: String,
+    /// For example `production`, `dev` or `local`.
+    pub environment: String,
+    /// The kind of work, for example `listing.parse`.
+    pub operation: String,
+    /// Groups the calls of one conversation, for example one support chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub entity_type: Option<String>,
-    /// Id of the object the call worked on.
+    pub session_id: Option<String>,
+    /// Flat key-value pairs, for example `{ "listing_id": "123" }`. At most 32
+    /// entries; keys are 1–64 characters of `A-Z a-z 0-9 _ . -`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "Record<string, string>")]
+    pub metadata: Option<BTreeMap<String, String>>,
+    /// The request URL. The server drops query string and fragment.
+    pub url: String,
+    /// The request body exactly as sent.
+    pub request: String,
+    /// The response as received. Absent when no response arrived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub entity_id: Option<String>,
-    /// Groups calls that belong to one logical operation, for example retries.
+    pub response: Option<RawResponse>,
+    /// HTTP status of the response. Absent when no response arrived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub trace_id: Option<String>,
-    /// Who served the call, for example `openrouter`.
-    pub provider: String,
-    /// Model identifier as reported by the provider.
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub reasoning_effort: Option<String>,
-    pub status: CallStatus,
-    /// Error message when `status` is `error`.
+    pub http_status: Option<u16>,
+    /// Client-side exception, for example a network failure or an abort.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub error: Option<String>,
-    /// 1-based attempt number within `trace_id`. Defaults to 1.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub attempt: Option<u32>,
-    /// Prompt tokens, including cached ones. Defaults to 0.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional, type = "number")]
-    pub input_tokens: Option<u64>,
-    /// Completion tokens, including reasoning ones. Defaults to 0.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional, type = "number")]
-    pub output_tokens: Option<u64>,
-    /// Subset of `input_tokens` served from the provider cache. Defaults to 0.
+    /// True when the client changed anything to fit the limits: clipped
+    /// `request` or `response`, or cleaned context (dropped invalid metadata
+    /// entries, clipped values, an empty operation recorded as `unattributed`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional, as = "Option<bool>")]
+    pub truncated: bool,
+    /// When the request was sent, RFC 3339.
+    #[ts(type = "string")]
+    pub started_at: DateTime<Utc>,
+    /// Streaming calls only: time until the first response chunk, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
-    pub cached_input_tokens: Option<u64>,
-    /// Subset of `output_tokens` spent on reasoning. Defaults to 0.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional, type = "number")]
-    pub reasoning_tokens: Option<u64>,
-    /// Cost billed by the provider in USD. Omit when unknown; never estimate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub cost_usd: Option<f64>,
-    /// Wall-clock duration of the call in milliseconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional, type = "number")]
-    pub latency_ms: Option<u64>,
-    /// Free-form JSON object for anything else. At most 8 KiB.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional, type = "Record<string, unknown>")]
-    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub ttft_ms: Option<u64>,
+    /// Time until the response was complete (or failed), in milliseconds.
+    #[ts(type = "number")]
+    pub latency_ms: u64,
 }
 
-impl NewAiCall {
+impl CallRecord {
     /// Checks every field against [`limits`]. Returns a human-readable reason.
     pub fn validate(&self) -> Result<(), String> {
-        check_text("id", &self.id, limits::MAX_ID_LEN, true)?;
-        check_text("feature", &self.feature, limits::MAX_TEXT_LEN, true)?;
-        check_text("provider", &self.provider, limits::MAX_TEXT_LEN, true)?;
-        check_text("model", &self.model, limits::MAX_TEXT_LEN, true)?;
-        for (name, value) in [
-            ("entity_type", &self.entity_type),
-            ("entity_id", &self.entity_id),
-            ("trace_id", &self.trace_id),
-            ("reasoning_effort", &self.reasoning_effort),
-        ] {
-            if let Some(value) = value {
-                check_text(name, value, limits::MAX_TEXT_LEN, true)?;
-            }
-        }
-        if let Some(error) = &self.error {
-            check_text("error", error, limits::MAX_ERROR_LEN, false)?;
-        }
-        if self.attempt.is_some_and(|attempt| !(1..=limits::MAX_ATTEMPT).contains(&attempt)) {
-            return Err(format!("attempt must be between 1 and {}", limits::MAX_ATTEMPT));
-        }
-        for (name, value) in [
-            ("input_tokens", self.input_tokens),
-            ("output_tokens", self.output_tokens),
-            ("cached_input_tokens", self.cached_input_tokens),
-            ("reasoning_tokens", self.reasoning_tokens),
-            ("latency_ms", self.latency_ms),
-        ] {
-            if value.is_some_and(|value| value > limits::MAX_COUNT) {
-                return Err(format!("{name} must be at most {}", limits::MAX_COUNT));
-            }
-        }
-        if self.cached_input_tokens.unwrap_or(0) > self.input_tokens.unwrap_or(0) {
-            return Err("cached_input_tokens must not exceed input_tokens".into());
-        }
-        if self.reasoning_tokens.unwrap_or(0) > self.output_tokens.unwrap_or(0) {
-            return Err("reasoning_tokens must not exceed output_tokens".into());
-        }
-        if let Some(cost) = self.cost_usd
-            && !(0.0..=limits::MAX_COST_USD).contains(&cost)
-        {
-            return Err(format!("cost_usd must be between 0 and {}", limits::MAX_COST_USD));
+        check_line("id", &self.id, limits::MAX_ID_LEN)?;
+        check_line("service", &self.service, limits::MAX_NAME_LEN)?;
+        check_line("environment", &self.environment, limits::MAX_NAME_LEN)?;
+        check_line("operation", &self.operation, limits::MAX_NAME_LEN)?;
+        if let Some(session_id) = &self.session_id {
+            check_line("session_id", session_id, limits::MAX_NAME_LEN)?;
         }
         if let Some(metadata) = &self.metadata {
-            let size = serde_json::to_vec(metadata).map_or(usize::MAX, |bytes| bytes.len());
-            if size > limits::MAX_METADATA_BYTES {
-                return Err(format!("metadata must be at most {} bytes as JSON", limits::MAX_METADATA_BYTES));
+            if metadata.len() > limits::MAX_METADATA_ENTRIES {
+                return Err(format!("metadata must have at most {} entries", limits::MAX_METADATA_ENTRIES));
             }
+            for (key, value) in metadata {
+                if !is_metadata_key(key) {
+                    return Err(format!(
+                        "metadata key `{key}` must be 1–{} characters of A-Z a-z 0-9 _ . -",
+                        limits::MAX_METADATA_KEY_LEN
+                    ));
+                }
+                if value.len() > limits::MAX_METADATA_VALUE_LEN || value.contains('\0') {
+                    return Err(format!(
+                        "metadata value of `{key}` must be at most {} bytes without NUL",
+                        limits::MAX_METADATA_VALUE_LEN
+                    ));
+                }
+            }
+        }
+        check_line("url", self.stored_url(), limits::MAX_URL_LEN)?;
+        if !(self.url.starts_with("https://") || self.url.starts_with("http://")) {
+            return Err("url must be an http(s) URL".into());
+        }
+        if self.request.len() > limits::MAX_REQUEST_BYTES {
+            return Err(format!("request must be at most {} bytes", limits::MAX_REQUEST_BYTES));
+        }
+        if let Some(response) = &self.response {
+            if response.byte_len() > limits::MAX_RESPONSE_BYTES {
+                return Err(format!("response must be at most {} bytes", limits::MAX_RESPONSE_BYTES));
+            }
+            if self.http_status.is_none() {
+                return Err("response requires http_status".into());
+            }
+        }
+        if let Some(status) = self.http_status
+            && !(100..=599).contains(&status)
+        {
+            return Err("http_status must be between 100 and 599".into());
+        }
+        if let Some(error) = &self.error
+            && (error.trim().is_empty() || error.len() > limits::MAX_ERROR_LEN)
+        {
+            return Err(format!("error must be 1–{} bytes", limits::MAX_ERROR_LEN));
+        }
+        if self.latency_ms > limits::MAX_DURATION_MS {
+            return Err(format!("latency_ms must be at most {}", limits::MAX_DURATION_MS));
+        }
+        if self.ttft_ms.is_some_and(|ttft| ttft > self.latency_ms) {
+            return Err("ttft_ms must not exceed latency_ms".into());
         }
         Ok(())
     }
+
+    /// `url` without query string and fragment, which can carry API keys.
+    pub fn stored_url(&self) -> &str {
+        let end = self.url.find(['?', '#']).unwrap_or(self.url.len());
+        &self.url[..end]
+    }
 }
 
-fn check_text(name: &str, value: &str, max: usize, single_line: bool) -> Result<(), String> {
+fn check_line(name: &str, value: &str, max: usize) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{name} must not be empty"));
     }
     if value.len() > max {
         return Err(format!("{name} must be at most {max} bytes"));
     }
-    if value.contains('\0') || (single_line && value.chars().any(char::is_control)) {
+    if value.chars().any(char::is_control) {
         return Err(format!("{name} must not contain control characters"));
     }
     Ok(())
 }
 
-/// One AI call as stored by the ledger. Defaults of [`NewAiCall`] are resolved.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
-pub struct AiCall {
-    pub id: String,
-    #[ts(type = "string")]
-    pub occurred_at: DateTime<Utc>,
-    /// When the ledger first accepted the call, RFC 3339.
-    #[ts(type = "string")]
-    pub received_at: DateTime<Utc>,
-    pub feature: String,
-    pub entity_type: Option<String>,
-    pub entity_id: Option<String>,
-    pub trace_id: Option<String>,
-    pub provider: String,
-    pub model: String,
-    pub reasoning_effort: Option<String>,
-    pub status: CallStatus,
-    pub error: Option<String>,
-    pub attempt: u32,
-    #[ts(type = "number")]
-    pub input_tokens: u64,
-    #[ts(type = "number")]
-    pub output_tokens: u64,
-    #[ts(type = "number")]
-    pub cached_input_tokens: u64,
-    #[ts(type = "number")]
-    pub reasoning_tokens: u64,
-    pub cost_usd: Option<f64>,
-    #[ts(type = "number | null")]
-    pub latency_ms: Option<u64>,
-    #[ts(type = "Record<string, unknown> | null")]
-    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+fn is_metadata_key(key: &str) -> bool {
+    (1..=limits::MAX_METADATA_KEY_LEN).contains(&key.len())
+        && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
-/// Body of `POST /v1/calls` on the ingestion listener.
+/// Body of `POST /v1/calls` on the ingestion listener. The body may be
+/// gzip-compressed (`Content-Encoding: gzip`).
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
-#[serde(deny_unknown_fields)]
 pub struct IngestRequest {
-    /// 1–1000 calls. The batch is validated as a whole: one invalid call
-    /// rejects the request and nothing is stored.
-    pub calls: Vec<NewAiCall>,
+    /// 1–500 records. Each record is validated on its own: invalid records are
+    /// reported in `rejected`, the valid ones are stored.
+    pub calls: Vec<CallRecord>,
+}
+
+/// A record of an ingestion request that was not stored.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+pub struct RejectedCall {
+    /// Position of the record in `calls`.
+    pub index: u32,
+    pub reason: String,
 }
 
 /// Response of `POST /v1/calls`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
 pub struct IngestResponse {
-    /// Calls stored by this request.
+    /// Records stored by this request.
     pub accepted: u32,
-    /// Calls whose id was already stored, or repeated within the batch.
+    /// Records whose id was already stored, or repeated within the request.
     pub duplicates: u32,
+    /// Records that failed validation. Retrying them will not succeed.
+    pub rejected: Vec<RejectedCall>,
+}
+
+/// A stored call without its request and response bodies.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+pub struct CallEnvelope {
+    /// Position in the ingestion queue; increases with every stored record.
+    #[ts(type = "number")]
+    pub seq: u64,
+    pub id: String,
+    /// When the server stored the record, RFC 3339.
+    #[ts(type = "string")]
+    pub received_at: DateTime<Utc>,
+    pub service: String,
+    pub environment: String,
+    pub operation: String,
+    pub session_id: Option<String>,
+    #[ts(type = "Record<string, string>")]
+    pub metadata: BTreeMap<String, String>,
+    /// Without query string and fragment.
+    pub url: String,
+    pub http_status: Option<u16>,
+    pub error: Option<String>,
+    pub truncated: bool,
+    #[ts(type = "string")]
+    pub started_at: DateTime<Utc>,
+    #[ts(type = "number | null")]
+    pub ttft_ms: Option<u64>,
+    #[ts(type = "number")]
+    pub latency_ms: u64,
+    #[ts(type = "number")]
+    pub request_bytes: u64,
+    #[ts(type = "number")]
+    pub response_bytes: u64,
+}
+
+/// Response of `GET /v1/calls/{id}`: the envelope plus request and response.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+pub struct StoredCall {
+    #[serde(flatten)]
+    pub envelope: CallEnvelope,
+    pub request: String,
+    pub response: Option<RawResponse>,
 }
 
 /// Filters shared by `GET /v1/calls` and `GET /v1/summary`. Every filter is
-/// optional and they combine with AND. `from` is inclusive, `to` exclusive.
+/// optional and they combine with AND. `from` (inclusive) and `to`
+/// (exclusive) apply to `started_at`.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct ListCallsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub feature: Option<String>,
+    pub service: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub entity_type: Option<String>,
+    pub environment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub entity_id: Option<String>,
+    pub operation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub trace_id: Option<String>,
+    pub session_id: Option<String>,
+    /// True: only calls without a response, with status ≥ 400 or with a
+    /// client error. False: only the others.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub status: Option<CallStatus>,
+    pub failed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "string")]
     pub from: Option<DateTime<Utc>>,
@@ -325,55 +351,39 @@ pub struct ListCallsQuery {
     pub cursor: Option<String>,
 }
 
-/// Response of `GET /v1/calls`, newest call first.
+/// Response of `GET /v1/calls`, most recently stored first.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
 pub struct ListCallsResponse {
-    pub calls: Vec<AiCall>,
+    pub calls: Vec<CallEnvelope>,
     /// Pass as `cursor` to fetch the next page. `null` on the last page.
     pub next_cursor: Option<String>,
 }
 
 /// A column `GET /v1/summary` can group by. `day` and `hour` bucket
-/// `occurred_at` in UTC.
+/// `started_at` in UTC.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum Dimension {
-    Feature,
-    EntityType,
-    EntityId,
-    TraceId,
-    Provider,
-    Model,
-    ReasoningEffort,
-    Status,
+    Service,
+    Environment,
+    Operation,
+    SessionId,
+    HttpStatus,
     Day,
     Hour,
 }
 
 impl Dimension {
-    pub const ALL: [Self; 10] = [
-        Self::Feature,
-        Self::EntityType,
-        Self::EntityId,
-        Self::TraceId,
-        Self::Provider,
-        Self::Model,
-        Self::ReasoningEffort,
-        Self::Status,
-        Self::Day,
-        Self::Hour,
-    ];
+    pub const ALL: [Self; 7] =
+        [Self::Service, Self::Environment, Self::Operation, Self::SessionId, Self::HttpStatus, Self::Day, Self::Hour];
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Feature => "feature",
-            Self::EntityType => "entity_type",
-            Self::EntityId => "entity_id",
-            Self::TraceId => "trace_id",
-            Self::Provider => "provider",
-            Self::Model => "model",
-            Self::ReasoningEffort => "reasoning_effort",
-            Self::Status => "status",
+            Self::Service => "service",
+            Self::Environment => "environment",
+            Self::Operation => "operation",
+            Self::SessionId => "session_id",
+            Self::HttpStatus => "http_status",
             Self::Day => "day",
             Self::Hour => "hour",
         }
@@ -390,25 +400,19 @@ impl Dimension {
 pub struct SummaryQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub feature: Option<String>,
+    pub service: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub entity_type: Option<String>,
+    pub environment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub entity_id: Option<String>,
+    pub operation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub trace_id: Option<String>,
+    pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub status: Option<CallStatus>,
+    pub failed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "string")]
     pub from: Option<DateTime<Utc>>,
@@ -416,7 +420,7 @@ pub struct SummaryQuery {
     #[ts(optional, type = "string")]
     pub to: Option<DateTime<Utc>>,
     /// Dimensions to group by, at most once each. Sent as a comma-separated
-    /// query parameter (`group_by=feature,model`). Empty means one total row.
+    /// query parameter (`group_by=service,operation`). Empty means one total row.
     #[serde(
         default,
         deserialize_with = "deserialize_dimensions",
@@ -457,27 +461,20 @@ pub struct SummaryRow {
     pub group: BTreeMap<Dimension, Option<String>>,
     #[ts(type = "number")]
     pub calls: u64,
+    /// Calls without a response, with status ≥ 400 or with a client error.
     #[ts(type = "number")]
-    pub errors: u64,
+    pub failed: u64,
     #[ts(type = "number")]
-    pub input_tokens: u64,
+    pub request_bytes: u64,
     #[ts(type = "number")]
-    pub output_tokens: u64,
-    #[ts(type = "number")]
-    pub cached_input_tokens: u64,
-    #[ts(type = "number")]
-    pub reasoning_tokens: u64,
-    /// Sum of the known billed costs.
-    pub cost_usd: f64,
-    /// Calls without a billed cost; `cost_usd` excludes them.
-    #[ts(type = "number")]
-    pub calls_without_cost: u64,
-    /// Mean and 95th percentile of the known latencies.
+    pub response_bytes: u64,
     pub latency_ms_avg: Option<f64>,
     pub latency_ms_p95: Option<f64>,
+    pub latency_ms_p99: Option<f64>,
+    pub ttft_ms_p95: Option<f64>,
 }
 
-/// Response of `GET /v1/summary`, highest `cost_usd` first.
+/// Response of `GET /v1/summary`, most calls first.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
 pub struct SummaryResponse {
     pub rows: Vec<SummaryRow>,
@@ -517,79 +514,83 @@ pub struct ApiError {
 mod tests {
     use super::*;
 
-    fn call() -> NewAiCall {
+    fn record() -> CallRecord {
         serde_json::from_value(serde_json::json!({
             "id": "c1",
-            "occurred_at": "2026-10-08T10:00:00Z",
-            "feature": "listing.parse",
-            "provider": "openrouter",
-            "model": "openai/gpt-5",
-            "status": "ok",
-            "input_tokens": 100,
-            "cached_input_tokens": 40,
-            "output_tokens": 20,
+            "service": "web",
+            "environment": "production",
+            "operation": "listing.parse",
+            "metadata": { "listing_id": "123" },
+            "url": "https://openrouter.ai/api/v1/chat/completions?key=secret#x",
+            "request": "{\"model\":\"openai/gpt-5-mini\",\"messages\":[]}",
+            "response": "{\"choices\":[]}",
+            "http_status": 200,
+            "started_at": "2026-10-08T10:00:00Z",
+            "ttft_ms": 120,
+            "latency_ms": 900,
         }))
         .unwrap()
     }
 
     #[test]
-    fn accepts_a_minimal_call() {
-        assert_eq!(call().validate(), Ok(()));
+    fn accepts_a_record_and_strips_the_query_string() {
+        let record = record();
+        assert_eq!(record.validate(), Ok(()));
+        assert_eq!(record.stored_url(), "https://openrouter.ai/api/v1/chat/completions");
+        assert!(!record.truncated);
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let result = serde_json::from_value::<NewAiCall>(serde_json::json!({
-            "id": "c1", "occurred_at": "2026-10-08T10:00:00Z", "feature": "f",
-            "provider": "p", "model": "m", "status": "ok", "tokens": 1,
-        }));
-        assert!(result.is_err());
+    fn response_is_a_body_or_a_list_of_events() {
+        let stream: CallRecord = serde_json::from_value(serde_json::json!({
+            "id": "c1", "service": "s", "environment": "e", "operation": "o", "url": "https://x/y",
+            "request": "{}", "response": ["data: {\"a\":1}", "data: [DONE]"], "http_status": 200,
+            "started_at": "2026-10-08T10:00:00Z", "latency_ms": 1,
+        }))
+        .unwrap();
+        assert_eq!(stream.response, Some(RawResponse::Events(vec!["data: {\"a\":1}".into(), "data: [DONE]".into()])));
+        assert_eq!(stream.response.as_ref().unwrap().byte_len(), 25);
+        assert_eq!(record().response, Some(RawResponse::Body("{\"choices\":[]}".into())));
     }
 
     #[test]
-    fn rejects_inconsistent_counts_and_costs() {
-        let mut bad = call();
-        bad.cached_input_tokens = Some(101);
-        assert!(bad.validate().is_err());
+    fn ignores_unknown_fields_and_rejects_invalid_values() {
+        let mut value = serde_json::to_value(record()).unwrap();
+        value["added_in_a_later_version"] = serde_json::json!({});
+        assert_eq!(serde_json::from_value::<CallRecord>(value).unwrap(), record());
 
-        let mut bad = call();
-        bad.cost_usd = Some(-0.1);
-        assert!(bad.validate().is_err());
+        // Only the stored part of the URL counts against the limit.
+        let mut long_query = record();
+        long_query.url = format!("https://x/y?{}", "k".repeat(limits::MAX_URL_LEN));
+        assert_eq!(long_query.validate(), Ok(()));
 
-        let mut bad = call();
-        bad.cost_usd = Some(f64::NAN);
-        assert!(bad.validate().is_err());
-
-        let mut bad = call();
-        bad.cost_usd = Some(1e308);
-        assert!(bad.validate().is_err());
-
-        let mut bad = call();
-        bad.attempt = Some(0);
-        assert!(bad.validate().is_err());
-
-        let mut bad = call();
-        bad.attempt = Some(3_000_000_000);
-        assert!(bad.validate().is_err());
-
-        let mut bad = call();
-        bad.feature = " ".into();
-        assert!(bad.validate().is_err());
-
-        let mut bad = call();
-        bad.entity_id = Some("a\nb".into());
-        assert!(bad.validate().is_err());
+        let invalid: [fn(&mut CallRecord); 9] = [
+            |r| r.operation = " ".into(),
+            |r| r.service = "a\nb".into(),
+            |r| r.url = "ftp://x".into(),
+            |r| r.http_status = Some(42),
+            |r| r.http_status = None,
+            |r| r.ttft_ms = Some(901),
+            |r| r.latency_ms = limits::MAX_DURATION_MS + 1,
+            |r| r.metadata = Some(BTreeMap::from([("bad key".into(), "v".into())])),
+            |r| r.request = "x".repeat(limits::MAX_REQUEST_BYTES + 1),
+        ];
+        for (index, mutate) in invalid.iter().enumerate() {
+            let mut bad = record();
+            mutate(&mut bad);
+            assert!(bad.validate().is_err(), "case {index} should be invalid");
+        }
     }
 
     #[test]
     fn group_by_round_trips_as_a_comma_list() {
-        let query = SummaryQuery { group_by: vec![Dimension::Feature, Dimension::Day], ..SummaryQuery::default() };
+        let query = SummaryQuery { group_by: vec![Dimension::Operation, Dimension::Day], ..SummaryQuery::default() };
         let encoded = serde_json::to_value(&query).unwrap();
-        assert_eq!(encoded, serde_json::json!({ "group_by": "feature,day" }));
+        assert_eq!(encoded, serde_json::json!({ "group_by": "operation,day" }));
         let decoded: SummaryQuery = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, query);
-        assert!(serde_json::from_value::<SummaryQuery>(serde_json::json!({ "group_by": "feature,feature" })).is_err());
-        assert!(serde_json::from_value::<SummaryQuery>(serde_json::json!({ "group_by": "nope" })).is_err());
+        assert!(serde_json::from_value::<SummaryQuery>(serde_json::json!({ "group_by": "day,day" })).is_err());
+        assert!(serde_json::from_value::<SummaryQuery>(serde_json::json!({ "group_by": "model" })).is_err());
     }
 
     #[test]

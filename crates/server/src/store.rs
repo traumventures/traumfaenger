@@ -1,8 +1,20 @@
-//! DuckDB storage. One table, `ai_calls`, keyed by the caller's call id.
+//! DuckDB storage, split CQRS-style.
 //!
-//! DuckDB connections are not `Sync`. The store keeps one writer connection and
-//! one reader connection to the same database, each behind its own mutex, so a
-//! slow summary never delays ingestion. HTTP handlers call store methods on a
+//! - **Write side:** `raw_calls` is an append-only log of the records exactly
+//!   as clients sent them. Ingestion only appends; it never parses.
+//! - **Read side:** projections (added later) each read the log in `seq`
+//!   order, maintain their own tables (calls, messages, tool calls, metrics per
+//!   time bucket) and record their position in `projection_checkpoints`. A
+//!   projection is rebuilt by resetting its checkpoint.
+//!
+//! `seq` order equals commit order: there is one writer connection and every
+//! batch is one transaction. A reader of `seq > last_seq` never skips a record.
+//! This holds only while every write to `raw_calls` goes through `Store::write`;
+//! never open a second writing connection.
+//!
+//! DuckDB connections are not `Sync`. The store keeps one writer and one
+//! reader connection to the same database, each behind its own mutex, so a
+//! slow query never delays ingestion. HTTP handlers call store methods on a
 //! blocking thread.
 
 use std::{
@@ -12,7 +24,7 @@ use std::{
 };
 
 use ai_ledger_api::{
-    AiCall, CallStatus, Dimension, IngestResponse, ListCallsQuery, ListCallsResponse, NewAiCall, SummaryQuery,
+    CallEnvelope, CallRecord, Dimension, ListCallsQuery, ListCallsResponse, RawResponse, StoredCall, SummaryQuery,
     SummaryResponse, SummaryRow, limits,
 };
 use chrono::{DateTime, Utc};
@@ -22,33 +34,47 @@ use duckdb::{
 };
 
 /// Ordered schema migrations. Append only; never edit a released entry.
-const MIGRATIONS: &[&str] = &["CREATE TABLE ai_calls (
+const MIGRATIONS: &[&str] = &["CREATE SEQUENCE raw_calls_seq START 1;
+    CREATE TABLE raw_calls (
+        seq BIGINT NOT NULL DEFAULT nextval('raw_calls_seq'),
         id VARCHAR PRIMARY KEY,
-        occurred_at TIMESTAMP NOT NULL,
         received_at TIMESTAMP NOT NULL,
-        feature VARCHAR NOT NULL,
-        entity_type VARCHAR,
-        entity_id VARCHAR,
-        trace_id VARCHAR,
-        provider VARCHAR NOT NULL,
-        model VARCHAR NOT NULL,
-        reasoning_effort VARCHAR,
-        status VARCHAR NOT NULL,
+        service VARCHAR NOT NULL,
+        environment VARCHAR NOT NULL,
+        operation VARCHAR NOT NULL,
+        session_id VARCHAR,
+        metadata VARCHAR NOT NULL,
+        url VARCHAR NOT NULL,
+        request VARCHAR NOT NULL,
+        response VARCHAR,
+        response_is_stream BOOLEAN,
+        http_status INTEGER,
         error VARCHAR,
-        attempt INTEGER NOT NULL,
-        input_tokens BIGINT NOT NULL,
-        output_tokens BIGINT NOT NULL,
-        cached_input_tokens BIGINT NOT NULL,
-        reasoning_tokens BIGINT NOT NULL,
-        cost_usd DOUBLE,
-        latency_ms BIGINT,
-        metadata VARCHAR
+        truncated BOOLEAN NOT NULL,
+        started_at TIMESTAMP NOT NULL,
+        ttft_ms BIGINT,
+        latency_ms BIGINT NOT NULL,
+        request_bytes BIGINT NOT NULL,
+        response_bytes BIGINT NOT NULL
+    );
+    CREATE TABLE projection_checkpoints (
+        projection VARCHAR PRIMARY KEY,
+        last_seq BIGINT NOT NULL
     )"];
 
-/// Timestamps are stored as UTC `TIMESTAMP` and exchanged as epoch microseconds.
-const CALL_COLUMNS: &str = "id, epoch_us(occurred_at), epoch_us(received_at), feature, entity_type, entity_id, \
-     trace_id, provider, model, reasoning_effort, status, error, attempt, input_tokens, output_tokens, \
-     cached_input_tokens, reasoning_tokens, cost_usd, latency_ms, metadata";
+/// Columns written on ingestion, in this order. `seq` takes its default.
+const INSERT_COLUMNS: &str = "id, received_at, service, environment, operation, session_id, metadata, url, \
+     request, response, response_is_stream, http_status, error, truncated, started_at, ttft_ms, latency_ms, \
+     request_bytes, response_bytes";
+
+/// Envelope columns. Timestamps are exchanged as epoch microseconds.
+const ENVELOPE_COLUMNS: &str = "seq, id, epoch_us(received_at), service, environment, operation, session_id, \
+     metadata, url, http_status, error, truncated, epoch_us(started_at), ttft_ms, latency_ms, request_bytes, \
+     response_bytes";
+
+/// A call failed when it got no response, a status of 400 or more, or a
+/// client-side error.
+const FAILED_SQL: &str = "(error IS NOT NULL OR http_status IS NULL OR http_status >= 400)";
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -76,6 +102,13 @@ impl From<duckdb::Error> for StoreError {
     }
 }
 
+/// Result of storing a batch of validated records.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct Inserted {
+    pub accepted: usize,
+    pub duplicates: usize,
+}
+
 pub struct Store {
     /// Owns the temp staging table, so all writes go through it.
     writer: Mutex<Connection>,
@@ -95,12 +128,14 @@ impl Store {
         // Nothing here needs one (plain TIMESTAMP columns, no ICU time zones).
         connection.execute_batch("SET autoinstall_known_extensions = false; SET autoload_known_extensions = false;")?;
         if let Some(limit) = memory_limit {
-            // SET takes no bind parameters; `is_size` restricts the value to `<digits><unit>`.
+            // SET takes no bind parameters; `is_size` restricts the value to `<number><unit>`.
             connection.execute_batch(&format!("SET memory_limit = '{limit}'"))?;
         }
         migrate(&connection)?;
         // Per-connection staging table for bulk inserts; see `insert`.
-        connection.execute_batch("CREATE TEMP TABLE ai_calls_staging AS SELECT * FROM ai_calls LIMIT 0")?;
+        connection.execute_batch(&format!(
+            "CREATE TEMP TABLE raw_calls_staging AS SELECT {INSERT_COLUMNS} FROM raw_calls LIMIT 0"
+        ))?;
         let reader = connection.try_clone()?;
         Ok(Self { writer: Mutex::new(connection), reader: Mutex::new(reader) })
     }
@@ -119,110 +154,117 @@ impl Store {
         Ok(())
     }
 
-    /// Stores validated calls in one transaction. Ids that already exist, or
+    /// Stores validated records in one transaction. Ids that already exist, or
     /// repeat within the batch, are counted as duplicates and left unchanged.
     ///
     /// Rows go through DuckDB's appender into a temporary staging table and
-    /// then into `ai_calls` with one `INSERT ... SELECT`; row-by-row inserts
+    /// then into `raw_calls` with one `INSERT ... SELECT`; row-by-row inserts
     /// against the primary-key index are orders of magnitude slower.
-    pub fn insert(&self, calls: &[NewAiCall], received_at: DateTime<Utc>) -> Result<IngestResponse, StoreError> {
-        let mut seen = HashSet::with_capacity(calls.len());
-        let unique: Vec<&NewAiCall> = calls.iter().filter(|call| seen.insert(call.id.as_str())).collect();
+    pub fn insert(&self, records: &[CallRecord], received_at: DateTime<Utc>) -> Result<Inserted, StoreError> {
+        let mut seen = HashSet::with_capacity(records.len());
+        let unique: Vec<&CallRecord> = records.iter().filter(|record| seen.insert(record.id.as_str())).collect();
 
         let mut connection = self.write();
         let transaction = connection.transaction()?;
-        transaction.execute_batch("DELETE FROM temp.ai_calls_staging")?;
+        transaction.execute_batch("DELETE FROM temp.raw_calls_staging")?;
         {
-            let mut appender = transaction.appender_to_catalog_and_db("ai_calls_staging", "temp", "main")?;
-            for call in &unique {
-                appender.append_row(appender_params_from_iter(row_values(call, received_at)))?;
+            let mut appender = transaction.appender_to_catalog_and_db("raw_calls_staging", "temp", "main")?;
+            for record in &unique {
+                appender.append_row(appender_params_from_iter(row_values(record, received_at)))?;
             }
             appender.flush()?;
         }
-        let inserted = transaction
-            .execute("INSERT INTO ai_calls SELECT * FROM temp.ai_calls_staging ON CONFLICT (id) DO NOTHING", [])?;
-        transaction.execute_batch("DELETE FROM temp.ai_calls_staging")?;
+        let accepted = transaction.execute(
+            &format!(
+                "INSERT INTO raw_calls ({INSERT_COLUMNS}) SELECT {INSERT_COLUMNS} FROM temp.raw_calls_staging \
+                 ON CONFLICT (id) DO NOTHING"
+            ),
+            [],
+        )?;
+        transaction.execute_batch("DELETE FROM temp.raw_calls_staging")?;
         transaction.commit()?;
-
-        // Batches are capped at `limits::MAX_BATCH_SIZE`, so both counts fit in u32.
-        let accepted = u32::try_from(inserted).unwrap_or(u32::MAX);
-        let duplicates = u32::try_from(calls.len().saturating_sub(inserted)).unwrap_or(u32::MAX);
-        Ok(IngestResponse { accepted, duplicates })
+        Ok(Inserted { accepted, duplicates: records.len() - accepted })
     }
 
-    pub fn get(&self, id: &str) -> Result<Option<AiCall>, StoreError> {
+    /// One stored call including request and response.
+    pub fn get(&self, id: &str) -> Result<Option<StoredCall>, StoreError> {
         let connection = self.read();
-        let mut statement = connection.prepare(&format!("SELECT {CALL_COLUMNS} FROM ai_calls WHERE id = ?"))?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {ENVELOPE_COLUMNS}, request, response, response_is_stream FROM raw_calls WHERE id = ?"
+        ))?;
         let mut rows = statement.query([id])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(read_call(row)?)),
-            None => Ok(None),
-        }
+        let Some(row) = rows.next()? else { return Ok(None) };
+        let envelope = read_envelope(row)?;
+        let base = ENVELOPE_LEN;
+        let request: String = row.get(base)?;
+        let response: Option<String> = row.get(base + 1)?;
+        let is_stream: Option<bool> = row.get(base + 2)?;
+        let response = match (response, is_stream) {
+            (None, _) => None,
+            (Some(body), Some(false) | None) => Some(RawResponse::Body(body)),
+            (Some(events), Some(true)) => Some(RawResponse::Events(
+                serde_json::from_str(&events).map_err(|_| StoreError::Corrupt("response events".into()))?,
+            )),
+        };
+        Ok(Some(StoredCall { envelope, request, response }))
     }
 
-    /// Newest first, keyset-paginated on `(occurred_at, id)`.
+    /// Envelopes, most recently stored first, keyset-paginated on `seq`.
     pub fn list(&self, query: &ListCallsQuery) -> Result<ListCallsResponse, StoreError> {
         let limit = page_size(query.limit, limits::DEFAULT_LIST_LIMIT, limits::MAX_LIST_LIMIT)?;
-        let mut filter = Filter::new(&Filters::from_list(query))?;
+        let mut filter = Filter::new(&filters_from!(query))?;
         if let Some(cursor) = &query.cursor {
-            let (occurred_at_us, id) = decode_cursor(cursor)?;
-            filter
-                .clauses
-                .push("(occurred_at < make_timestamp(?) OR (occurred_at = make_timestamp(?) AND id < ?))".into());
-            filter.params.extend([Value::BigInt(occurred_at_us), Value::BigInt(occurred_at_us), text(&id)]);
+            let seq: i64 = cursor.parse().map_err(|_| StoreError::Invalid("invalid `cursor`".into()))?;
+            filter.clauses.push("seq < ?".into());
+            filter.params.push(Value::BigInt(seq));
         }
         filter.params.push(Value::BigInt(i64::from(limit) + 1));
 
         let connection = self.read();
         let mut statement = connection.prepare(&format!(
-            "SELECT {CALL_COLUMNS} FROM ai_calls{} ORDER BY occurred_at DESC, id DESC LIMIT ?",
+            "SELECT {ENVELOPE_COLUMNS} FROM raw_calls{} ORDER BY seq DESC LIMIT ?",
             filter.where_sql()
         ))?;
         let mut rows = statement.query(params_from_iter(filter.params))?;
         let mut calls = Vec::new();
         while let Some(row) = rows.next()? {
-            calls.push(read_call(row)?);
+            calls.push(read_envelope(row)?);
         }
         let next_cursor = if calls.len() > limit as usize {
             calls.truncate(limit as usize);
-            calls.last().map(encode_cursor)
+            calls.last().map(|call| call.seq.to_string())
         } else {
             None
         };
         Ok(ListCallsResponse { calls, next_cursor })
     }
 
-    /// Aggregates by the requested dimensions, highest cost first.
+    /// Collection statistics grouped by the requested dimensions, most calls first.
     pub fn summary(&self, query: &SummaryQuery) -> Result<SummaryResponse, StoreError> {
         let limit = page_size(query.limit, limits::DEFAULT_SUMMARY_LIMIT, limits::MAX_SUMMARY_LIMIT)?;
-        let mut filter = Filter::new(&Filters::from_summary(query))?;
+        let mut filter = Filter::new(&filters_from!(query))?;
         filter.params.push(Value::BigInt(i64::from(limit) + 1));
 
         let dimensions = &query.group_by;
         let mut select: Vec<String> = dimensions.iter().map(|dimension| dimension_sql(*dimension).to_owned()).collect();
-        select.extend(
-            [
-                "count(*)",
-                "count(*) FILTER (WHERE status = 'error')",
-                "CAST(coalesce(sum(input_tokens), 0) AS BIGINT)",
-                "CAST(coalesce(sum(output_tokens), 0) AS BIGINT)",
-                "CAST(coalesce(sum(cached_input_tokens), 0) AS BIGINT)",
-                "CAST(coalesce(sum(reasoning_tokens), 0) AS BIGINT)",
-                "CAST(coalesce(sum(cost_usd), 0) AS DOUBLE)",
-                "count(*) FILTER (WHERE cost_usd IS NULL)",
-                "CAST(avg(latency_ms) AS DOUBLE)",
-                "CAST(quantile_cont(latency_ms, 0.95) AS DOUBLE)",
-            ]
-            .map(str::to_owned),
-        );
-        // ORDER BY and GROUP BY reference select positions; dimensions come first.
+        select.extend([
+            "count(*)".to_owned(),
+            format!("count(*) FILTER (WHERE {FAILED_SQL})"),
+            "CAST(coalesce(sum(request_bytes), 0) AS BIGINT)".to_owned(),
+            "CAST(coalesce(sum(response_bytes), 0) AS BIGINT)".to_owned(),
+            "CAST(avg(latency_ms) AS DOUBLE)".to_owned(),
+            "CAST(quantile_cont(latency_ms, 0.95) AS DOUBLE)".to_owned(),
+            "CAST(quantile_cont(latency_ms, 0.99) AS DOUBLE)".to_owned(),
+            "CAST(quantile_cont(ttft_ms, 0.95) AS DOUBLE)".to_owned(),
+        ]);
+        // GROUP BY and ORDER BY reference select positions; dimensions come first.
         let positions: Vec<String> = (1..=dimensions.len()).map(|position| position.to_string()).collect();
         let group_by =
             if dimensions.is_empty() { String::new() } else { format!(" GROUP BY {}", positions.join(", ")) };
-        let mut order = vec![format!("{} DESC", dimensions.len() + 7), format!("{} DESC", dimensions.len() + 1)];
+        let mut order = vec![format!("{} DESC", dimensions.len() + 1)];
         order.extend(positions.iter().map(|position| format!("{position} ASC NULLS LAST")));
         let sql = format!(
-            "SELECT {} FROM ai_calls{}{group_by} ORDER BY {} LIMIT ?",
+            "SELECT {} FROM raw_calls{}{group_by} ORDER BY {} LIMIT ?",
             select.join(", "),
             filter.where_sql(),
             order.join(", ")
@@ -238,27 +280,45 @@ impl Store {
                 group.insert(*dimension, row.get::<_, Option<String>>(index)?);
             }
             let base = dimensions.len();
-            let unsigned = |offset: usize| -> Result<u64, StoreError> {
-                let value: i64 = row.get(base + offset)?;
-                u64::try_from(value).map_err(|_| StoreError::Corrupt(format!("negative aggregate {value}")))
-            };
             out.push(SummaryRow {
                 group,
-                calls: unsigned(0)?,
-                errors: unsigned(1)?,
-                input_tokens: unsigned(2)?,
-                output_tokens: unsigned(3)?,
-                cached_input_tokens: unsigned(4)?,
-                reasoning_tokens: unsigned(5)?,
-                cost_usd: row.get(base + 6)?,
-                calls_without_cost: unsigned(7)?,
-                latency_ms_avg: row.get(base + 8)?,
-                latency_ms_p95: row.get(base + 9)?,
+                calls: unsigned(row, base)?,
+                failed: unsigned(row, base + 1)?,
+                request_bytes: unsigned(row, base + 2)?,
+                response_bytes: unsigned(row, base + 3)?,
+                latency_ms_avg: row.get(base + 4)?,
+                latency_ms_p95: row.get(base + 5)?,
+                latency_ms_p99: row.get(base + 6)?,
+                ttft_ms_p95: row.get(base + 7)?,
             });
         }
         let truncated = out.len() > limit as usize;
         out.truncate(limit as usize);
         Ok(SummaryResponse { rows: out, truncated })
+    }
+
+    /// Deletes records received before `cutoff` that every projection has
+    /// already processed. Without any projection nothing counts as processed,
+    /// so nothing is deleted: the log is what future projections will read.
+    ///
+    /// Deletes in chunks and releases the writer between them, so ingestion
+    /// is not blocked for long. Returns how many records were deleted.
+    pub fn delete_received_before(&self, cutoff: DateTime<Utc>) -> Result<usize, StoreError> {
+        const CHUNK: i64 = 10_000;
+        let mut total = 0;
+        loop {
+            let deleted = self.write().execute(
+                "DELETE FROM raw_calls WHERE seq IN (SELECT seq FROM raw_calls \
+                 WHERE received_at < make_timestamp(?) \
+                 AND seq <= (SELECT coalesce(min(last_seq), 0) FROM projection_checkpoints) \
+                 ORDER BY seq LIMIT ?)",
+                [cutoff.timestamp_micros(), CHUNK],
+            )?;
+            total += deleted;
+            if deleted < CHUNK as usize {
+                return Ok(total);
+            }
+        }
     }
 }
 
@@ -301,8 +361,8 @@ fn is_size(value: &str) -> bool {
 /// The filter fields shared by list and summary queries.
 struct Filters<'a> {
     /// Column name and value. Column names are fixed here, never from a request.
-    text: [(&'static str, Option<&'a str>); 6],
-    status: Option<CallStatus>,
+    text: [(&'static str, Option<&'a str>); 4],
+    failed: Option<bool>,
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
 }
@@ -311,29 +371,18 @@ macro_rules! filters_from {
     ($query:expr) => {
         Filters {
             text: [
-                ("feature", $query.feature.as_deref()),
-                ("entity_type", $query.entity_type.as_deref()),
-                ("entity_id", $query.entity_id.as_deref()),
-                ("trace_id", $query.trace_id.as_deref()),
-                ("provider", $query.provider.as_deref()),
-                ("model", $query.model.as_deref()),
+                ("service", $query.service.as_deref()),
+                ("environment", $query.environment.as_deref()),
+                ("operation", $query.operation.as_deref()),
+                ("session_id", $query.session_id.as_deref()),
             ],
-            status: $query.status,
+            failed: $query.failed,
             from: $query.from,
             to: $query.to,
         }
     };
 }
-
-impl<'a> Filters<'a> {
-    fn from_list(query: &'a ListCallsQuery) -> Self {
-        filters_from!(query)
-    }
-
-    fn from_summary(query: &'a SummaryQuery) -> Self {
-        filters_from!(query)
-    }
-}
+use filters_from;
 
 struct Filter {
     clauses: Vec<String>,
@@ -354,16 +403,17 @@ impl Filter {
                 filter.params.push(text(value));
             }
         }
-        if let Some(status) = filters.status {
-            filter.clauses.push("status = ?".into());
-            filter.params.push(text(status.as_str()));
+        match filters.failed {
+            Some(true) => filter.clauses.push(FAILED_SQL.into()),
+            Some(false) => filter.clauses.push(format!("NOT {FAILED_SQL}")),
+            None => {}
         }
         if let Some(from) = filters.from {
-            filter.clauses.push("occurred_at >= make_timestamp(?)".into());
+            filter.clauses.push("started_at >= make_timestamp(?)".into());
             filter.params.push(Value::BigInt(from.timestamp_micros()));
         }
         if let Some(to) = filters.to {
-            filter.clauses.push("occurred_at < make_timestamp(?)".into());
+            filter.clauses.push("started_at < make_timestamp(?)".into());
             filter.params.push(Value::BigInt(to.timestamp_micros()));
         }
         Ok(filter)
@@ -376,16 +426,13 @@ impl Filter {
 
 fn dimension_sql(dimension: Dimension) -> &'static str {
     match dimension {
-        Dimension::Feature => "feature",
-        Dimension::EntityType => "entity_type",
-        Dimension::EntityId => "entity_id",
-        Dimension::TraceId => "trace_id",
-        Dimension::Provider => "provider",
-        Dimension::Model => "model",
-        Dimension::ReasoningEffort => "reasoning_effort",
-        Dimension::Status => "status",
-        Dimension::Day => "strftime(occurred_at, '%Y-%m-%d')",
-        Dimension::Hour => "strftime(occurred_at, '%Y-%m-%dT%H:00:00Z')",
+        Dimension::Service => "service",
+        Dimension::Environment => "environment",
+        Dimension::Operation => "operation",
+        Dimension::SessionId => "session_id",
+        Dimension::HttpStatus => "CAST(http_status AS VARCHAR)",
+        Dimension::Day => "strftime(started_at, '%Y-%m-%d')",
+        Dimension::Hour => "strftime(started_at, '%Y-%m-%dT%H:00:00Z')",
     }
 }
 
@@ -397,46 +444,41 @@ fn page_size(requested: Option<u32>, default: u32, max: u32) -> Result<u32, Stor
     }
 }
 
-/// Cursor format: `<occurred_at as epoch microseconds>.<id>`. Opaque to clients.
-fn encode_cursor(call: &AiCall) -> String {
-    format!("{}.{}", call.occurred_at.timestamp_micros(), call.id)
-}
-
-fn decode_cursor(cursor: &str) -> Result<(i64, String), StoreError> {
-    let invalid = || StoreError::Invalid("invalid `cursor`".into());
-    let (micros, id) = cursor.split_once('.').ok_or_else(invalid)?;
-    let micros = micros.parse().map_err(|_| invalid())?;
-    if id.is_empty() {
-        return Err(invalid());
-    }
-    Ok((micros, id.to_owned()))
-}
-
-/// Column values of one call, in `ai_calls` column order.
-fn row_values(call: &NewAiCall, received_at: DateTime<Utc>) -> [Value; 20] {
-    let metadata = call.metadata.as_ref().map(|map| serde_json::Value::Object(map.clone()).to_string());
+/// Column values of one record, in [`INSERT_COLUMNS`] order.
+fn row_values(record: &CallRecord, received_at: DateTime<Utc>) -> [Value; 19] {
+    let metadata = serde_json::to_string(&record.metadata.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".into());
+    let (response, is_stream) = match &record.response {
+        None => (Value::Null, Value::Null),
+        Some(RawResponse::Body(body)) => (text(body), Value::Boolean(false)),
+        Some(RawResponse::Events(events)) => {
+            (Value::Text(serde_json::to_string(events).unwrap_or_default()), Value::Boolean(true))
+        }
+    };
     [
-        text(&call.id),
-        Value::Timestamp(TimeUnit::Microsecond, call.occurred_at.timestamp_micros()),
-        Value::Timestamp(TimeUnit::Microsecond, received_at.timestamp_micros()),
-        text(&call.feature),
-        optional_text(call.entity_type.as_deref()),
-        optional_text(call.entity_id.as_deref()),
-        optional_text(call.trace_id.as_deref()),
-        text(&call.provider),
-        text(&call.model),
-        optional_text(call.reasoning_effort.as_deref()),
-        text(call.status.as_str()),
-        optional_text(call.error.as_deref()),
-        Value::Int(i32::try_from(call.attempt.unwrap_or(1)).unwrap_or(i32::MAX)),
-        count(call.input_tokens.unwrap_or(0)),
-        count(call.output_tokens.unwrap_or(0)),
-        count(call.cached_input_tokens.unwrap_or(0)),
-        count(call.reasoning_tokens.unwrap_or(0)),
-        call.cost_usd.map_or(Value::Null, Value::Double),
-        call.latency_ms.map_or(Value::Null, count),
-        metadata.map_or(Value::Null, Value::Text),
+        text(&record.id),
+        timestamp(received_at),
+        text(&record.service),
+        text(&record.environment),
+        text(&record.operation),
+        optional_text(record.session_id.as_deref()),
+        Value::Text(metadata),
+        text(record.stored_url()),
+        text(&record.request),
+        response,
+        is_stream,
+        record.http_status.map_or(Value::Null, |status| Value::Int(i32::from(status))),
+        optional_text(record.error.as_deref()),
+        Value::Boolean(record.truncated),
+        timestamp(record.started_at),
+        record.ttft_ms.map_or(Value::Null, count),
+        count(record.latency_ms),
+        count(record.request.len() as u64),
+        count(record.response.as_ref().map_or(0, RawResponse::byte_len) as u64),
     ]
+}
+
+fn timestamp(value: DateTime<Utc>) -> Value {
+    Value::Timestamp(TimeUnit::Microsecond, value.timestamp_micros())
 }
 
 fn text(value: &str) -> Value {
@@ -447,52 +489,48 @@ fn optional_text(value: Option<&str>) -> Value {
     value.map_or(Value::Null, text)
 }
 
-/// Counts are validated against `limits::MAX_COUNT`, far below `i64::MAX`.
+/// Durations and byte counts are bounded by the limits, far below `i64::MAX`.
 fn count(value: u64) -> Value {
     Value::BigInt(i64::try_from(value).unwrap_or(i64::MAX))
 }
 
-fn read_call(row: &Row<'_>) -> Result<AiCall, StoreError> {
+const ENVELOPE_LEN: usize = 17;
+
+fn unsigned(row: &Row<'_>, index: usize) -> Result<u64, StoreError> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|_| StoreError::Corrupt(format!("negative value {value} in column {index}")))
+}
+
+fn read_envelope(row: &Row<'_>) -> Result<CallEnvelope, StoreError> {
     let timestamp = |index: usize| -> Result<DateTime<Utc>, StoreError> {
         let micros: i64 = row.get(index)?;
         DateTime::from_timestamp_micros(micros).ok_or_else(|| StoreError::Corrupt(format!("timestamp {micros}")))
     };
-    let unsigned = |index: usize| -> Result<u64, StoreError> {
-        let value: i64 = row.get(index)?;
-        u64::try_from(value).map_err(|_| StoreError::Corrupt(format!("negative count {value}")))
-    };
-    let status: String = row.get(10)?;
-    let attempt: i32 = row.get(12)?;
-    let latency_ms: Option<i64> = row.get(18)?;
-    let metadata: Option<String> = row.get(19)?;
-    Ok(AiCall {
-        id: row.get(0)?,
-        occurred_at: timestamp(1)?,
+    let metadata: String = row.get(7)?;
+    let http_status: Option<i32> = row.get(9)?;
+    let ttft_ms: Option<i64> = row.get(13)?;
+    Ok(CallEnvelope {
+        seq: unsigned(row, 0)?,
+        id: row.get(1)?,
         received_at: timestamp(2)?,
-        feature: row.get(3)?,
-        entity_type: row.get(4)?,
-        entity_id: row.get(5)?,
-        trace_id: row.get(6)?,
-        provider: row.get(7)?,
-        model: row.get(8)?,
-        reasoning_effort: row.get(9)?,
-        status: CallStatus::parse(&status).ok_or_else(|| StoreError::Corrupt(format!("status `{status}`")))?,
-        error: row.get(11)?,
-        attempt: u32::try_from(attempt).map_err(|_| StoreError::Corrupt(format!("attempt {attempt}")))?,
-        input_tokens: unsigned(13)?,
-        output_tokens: unsigned(14)?,
-        cached_input_tokens: unsigned(15)?,
-        reasoning_tokens: unsigned(16)?,
-        cost_usd: row.get(17)?,
-        latency_ms: latency_ms
-            .map(|value| u64::try_from(value).map_err(|_| StoreError::Corrupt(format!("latency {value}"))))
+        service: row.get(3)?,
+        environment: row.get(4)?,
+        operation: row.get(5)?,
+        session_id: row.get(6)?,
+        metadata: serde_json::from_str(&metadata).map_err(|_| StoreError::Corrupt("metadata".into()))?,
+        url: row.get(8)?,
+        http_status: http_status
+            .map(|status| u16::try_from(status).map_err(|_| StoreError::Corrupt(format!("http_status {status}"))))
             .transpose()?,
-        metadata: metadata
-            .map(|json| match serde_json::from_str(&json) {
-                Ok(serde_json::Value::Object(map)) => Ok(map),
-                _ => Err(StoreError::Corrupt("metadata is not a JSON object".into())),
-            })
+        error: row.get(10)?,
+        truncated: row.get(11)?,
+        started_at: timestamp(12)?,
+        ttft_ms: ttft_ms
+            .map(|value| u64::try_from(value).map_err(|_| StoreError::Corrupt(format!("ttft_ms {value}"))))
             .transpose()?,
+        latency_ms: unsigned(row, 14)?,
+        request_bytes: unsigned(row, 15)?,
+        response_bytes: unsigned(row, 16)?,
     })
 }
 
@@ -508,77 +546,87 @@ mod tests {
         DateTime::parse_from_rfc3339(rfc3339).unwrap().with_timezone(&Utc)
     }
 
-    fn call(id: &str, occurred_at: &str, feature: &str, model: &str, cost: Option<f64>) -> NewAiCall {
+    fn record(id: &str, started_at: &str, operation: &str) -> CallRecord {
         serde_json::from_value(serde_json::json!({
             "id": id,
-            "occurred_at": occurred_at,
-            "feature": feature,
-            "provider": "openrouter",
-            "model": model,
-            "status": "ok",
-            "input_tokens": 100,
-            "cached_input_tokens": 10,
-            "output_tokens": 50,
-            "reasoning_tokens": 5,
-            "cost_usd": cost,
+            "service": "web",
+            "environment": "production",
+            "operation": operation,
+            "session_id": "s1",
+            "metadata": { "listing_id": "123" },
+            "url": "https://openrouter.ai/api/v1/chat/completions?key=secret",
+            "request": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Hallo\"}]}",
+            "response": "{\"choices\":[]}",
+            "http_status": 200,
+            "started_at": started_at,
+            "ttft_ms": 100,
             "latency_ms": 200,
-            "entity_type": "listing",
-            "entity_id": "123",
-            "metadata": { "prompt_version": 3 },
         }))
         .unwrap()
     }
 
     #[test]
-    fn round_trips_a_call_and_resolves_defaults() {
+    fn round_trips_bodies_streams_and_failures_verbatim() {
         let store = store();
         let received = at("2026-10-08T12:00:00.123456Z");
-        let mut minimal = call("a", "2026-10-08T10:00:00.5Z", "parse", "m1", Some(0.002));
-        minimal.input_tokens = None;
-        minimal.cached_input_tokens = None;
-        minimal.attempt = None;
-        minimal.latency_ms = None;
-        minimal.metadata = None;
-        store.insert(&[minimal], received).unwrap();
+        let body = record("body", "2026-10-08T10:00:00.5Z", "parse");
+        let mut stream = record("stream", "2026-10-08T10:00:01Z", "chat");
+        stream.response = Some(RawResponse::Events(vec![
+            "event: message_start\ndata: {\"type\":\"message_start\"}".into(),
+            "data: [DONE]".into(),
+        ]));
+        let mut failed = record("failed", "2026-10-08T10:00:02Z", "chat");
+        failed.response = None;
+        failed.http_status = None;
+        failed.ttft_ms = None;
+        failed.metadata = None;
+        failed.session_id = None;
+        failed.error = Some("TypeError: fetch failed".into());
+        failed.truncated = true;
+        store.insert(&[body.clone(), stream.clone(), failed], received).unwrap();
 
-        let stored = store.get("a").unwrap().unwrap();
-        assert_eq!(stored.occurred_at, at("2026-10-08T10:00:00.5Z"));
-        assert_eq!(stored.received_at, received);
-        assert_eq!((stored.attempt, stored.input_tokens, stored.cached_input_tokens), (1, 0, 0));
-        assert_eq!(stored.output_tokens, 50);
-        assert_eq!(stored.latency_ms, None);
-        assert_eq!(stored.metadata, None);
-        assert_eq!(stored.cost_usd, Some(0.002));
+        let stored = store.get("body").unwrap().unwrap();
+        assert_eq!(stored.request, body.request);
+        assert_eq!(stored.response, body.response);
+        assert_eq!(stored.envelope.url, "https://openrouter.ai/api/v1/chat/completions");
+        assert_eq!(stored.envelope.received_at, received);
+        assert_eq!(stored.envelope.started_at, at("2026-10-08T10:00:00.5Z"));
+        assert_eq!(stored.envelope.metadata["listing_id"], "123");
+        assert_eq!(stored.envelope.request_bytes, body.request.len() as u64);
+        assert_eq!((stored.envelope.http_status, stored.envelope.ttft_ms), (Some(200), Some(100)));
+
+        assert_eq!(store.get("stream").unwrap().unwrap().response, stream.response);
+
+        let failed = store.get("failed").unwrap().unwrap();
+        assert_eq!(failed.response, None);
+        assert!(failed.envelope.metadata.is_empty());
+        assert!(failed.envelope.truncated);
+        assert_eq!(failed.envelope.error.as_deref(), Some("TypeError: fetch failed"));
         assert_eq!(store.get("missing").unwrap(), None);
-
-        store.insert(&[call("b", "2026-10-08T10:00:00Z", "parse", "m1", None)], received).unwrap();
-        let stored = store.get("b").unwrap().unwrap();
-        assert_eq!(stored.metadata.unwrap()["prompt_version"], 3);
-        assert_eq!(stored.latency_ms, Some(200));
-        assert_eq!(stored.cost_usd, None);
     }
 
     #[test]
     fn duplicate_ids_are_counted_and_first_write_wins() {
         let store = store();
-        let now = Utc::now();
-        let first = call("a", "2026-10-08T10:00:00Z", "parse", "m1", Some(1.0));
-        let changed = call("a", "2026-10-08T10:00:00Z", "parse", "m2", Some(9.0));
-        let result = store.insert(&[first, changed.clone()], now).unwrap();
-        assert_eq!((result.accepted, result.duplicates), (1, 1));
-        let result = store.insert(&[changed, call("b", "2026-10-08T10:00:00Z", "parse", "m1", None)], now).unwrap();
-        assert_eq!((result.accepted, result.duplicates), (1, 1));
-        assert_eq!(store.get("a").unwrap().unwrap().model, "m1");
+        let first = record("a", "2026-10-08T10:00:00Z", "parse");
+        let mut changed = first.clone();
+        changed.operation = "other".into();
+        let result = store.insert(&[first, changed.clone()], Utc::now()).unwrap();
+        assert_eq!(result, Inserted { accepted: 1, duplicates: 1 });
+        let result = store.insert(&[changed, record("b", "2026-10-08T10:00:00Z", "parse")], Utc::now()).unwrap();
+        assert_eq!(result, Inserted { accepted: 1, duplicates: 1 });
+        assert_eq!(store.get("a").unwrap().unwrap().envelope.operation, "parse");
     }
 
     #[test]
-    fn lists_newest_first_with_filters_and_stable_cursor() {
+    fn lists_newest_first_with_filters_and_cursor() {
         let store = store();
-        let calls: Vec<NewAiCall> = (0..5)
-            .map(|index| call(&format!("c{index}"), "2026-10-08T10:00:00Z", "parse", "m1", None))
-            .chain([call("late", "2026-10-08T11:00:00Z", "greet", "m1", None)])
-            .collect();
-        store.insert(&calls, Utc::now()).unwrap();
+        for index in 0..5 {
+            store.insert(&[record(&format!("c{index}"), "2026-10-08T10:00:00Z", "parse")], Utc::now()).unwrap();
+        }
+        let mut failed = record("late", "2026-10-08T11:00:00Z", "chat");
+        failed.http_status = Some(500);
+        store.insert(&[failed], Utc::now()).unwrap();
 
         let mut seen = Vec::new();
         let mut cursor = None;
@@ -593,16 +641,18 @@ mod tests {
         }
         assert_eq!(seen, ["late", "c4", "c3", "c2", "c1", "c0"]);
 
-        let only_parse = store.list(&ListCallsQuery { feature: Some("parse".into()), ..Default::default() }).unwrap();
-        assert_eq!(only_parse.calls.len(), 5);
-        let window = store
-            .list(&ListCallsQuery {
+        let count = |query: ListCallsQuery| store.list(&query).unwrap().calls.len();
+        assert_eq!(count(ListCallsQuery { operation: Some("parse".into()), ..Default::default() }), 5);
+        assert_eq!(count(ListCallsQuery { failed: Some(true), ..Default::default() }), 1);
+        assert_eq!(count(ListCallsQuery { failed: Some(false), ..Default::default() }), 5);
+        assert_eq!(
+            count(ListCallsQuery {
                 from: Some(at("2026-10-08T10:30:00Z")),
                 to: Some(at("2026-10-08T12:00:00Z")),
                 ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(window.calls.len(), 1);
+            }),
+            1
+        );
 
         let invalid = |query: ListCallsQuery| matches!(store.list(&query), Err(StoreError::Invalid(_)));
         assert!(invalid(ListCallsQuery { cursor: Some("garbage".into()), ..Default::default() }));
@@ -615,16 +665,16 @@ mod tests {
     }
 
     #[test]
-    fn summarises_by_dimensions_with_unknown_costs_kept_separate() {
+    fn summarises_collection_by_dimensions() {
         let store = store();
-        let mut failed = call("e", "2026-10-09T09:00:00Z", "parse", "m2", None);
-        failed.status = CallStatus::Error;
+        let mut failed = record("e", "2026-10-09T09:00:00Z", "parse");
+        failed.http_status = Some(429);
         store
             .insert(
                 &[
-                    call("a", "2026-10-08T10:00:00Z", "parse", "m1", Some(0.25)),
-                    call("b", "2026-10-08T23:00:00Z", "parse", "m1", Some(0.5)),
-                    call("c", "2026-10-08T10:00:00Z", "greet", "m1", Some(0.1)),
+                    record("a", "2026-10-08T10:00:00Z", "parse"),
+                    record("b", "2026-10-08T23:00:00Z", "parse"),
+                    record("c", "2026-10-08T10:00:00Z", "chat"),
                     failed,
                 ],
                 Utc::now(),
@@ -632,45 +682,58 @@ mod tests {
             .unwrap();
 
         let total = store.summary(&SummaryQuery::default()).unwrap();
-        assert_eq!(total.rows.len(), 1);
         let row = &total.rows[0];
-        assert_eq!((row.calls, row.errors, row.calls_without_cost), (4, 1, 1));
-        assert_eq!(
-            (row.input_tokens, row.cached_input_tokens, row.output_tokens, row.reasoning_tokens),
-            (400, 40, 200, 20)
-        );
-        assert!((row.cost_usd - 0.85).abs() < 1e-9);
+        assert_eq!((row.calls, row.failed), (4, 1));
         assert_eq!(row.latency_ms_avg, Some(200.0));
-        assert!(row.group.is_empty());
+        assert_eq!(row.ttft_ms_p95, Some(100.0));
+        assert!(row.request_bytes > 0 && row.group.is_empty());
 
-        let by_feature_day = store
-            .summary(&SummaryQuery { group_by: vec![Dimension::Feature, Dimension::Day], ..Default::default() })
+        let by = store
+            .summary(&SummaryQuery { group_by: vec![Dimension::Operation, Dimension::Day], ..Default::default() })
             .unwrap();
-        let keys: Vec<(Option<String>, Option<String>, u64)> = by_feature_day
+        let keys: Vec<(Option<String>, Option<String>, u64)> = by
             .rows
             .iter()
-            .map(|row| (row.group[&Dimension::Feature].clone(), row.group[&Dimension::Day].clone(), row.calls))
+            .map(|row| (row.group[&Dimension::Operation].clone(), row.group[&Dimension::Day].clone(), row.calls))
             .collect();
         assert_eq!(
             keys,
             [
                 (Some("parse".into()), Some("2026-10-08".into()), 2),
-                (Some("greet".into()), Some("2026-10-08".into()), 1),
+                (Some("chat".into()), Some("2026-10-08".into()), 1),
                 (Some("parse".into()), Some("2026-10-09".into()), 1),
             ]
         );
-        assert!(!by_feature_day.truncated);
 
-        let top_hour = store
-            .summary(&SummaryQuery { group_by: vec![Dimension::Hour], limit: Some(1), ..Default::default() })
+        let by_status = store
+            .summary(&SummaryQuery { group_by: vec![Dimension::HttpStatus], limit: Some(1), ..Default::default() })
             .unwrap();
-        assert_eq!(top_hour.rows.len(), 1);
-        assert!(top_hour.truncated);
-        assert_eq!(top_hour.rows[0].group[&Dimension::Hour].as_deref(), Some("2026-10-08T23:00:00Z"));
+        assert_eq!(by_status.rows[0].group[&Dimension::HttpStatus].as_deref(), Some("200"));
+        assert!(by_status.truncated);
 
-        let empty = store.summary(&SummaryQuery { feature: Some("none".into()), ..Default::default() }).unwrap();
+        let empty = store.summary(&SummaryQuery { service: Some("none".into()), ..Default::default() }).unwrap();
         assert_eq!(empty.rows[0].calls, 0);
         assert_eq!(empty.rows[0].latency_ms_avg, None);
+    }
+
+    #[test]
+    fn deletes_records_received_before_a_cutoff() {
+        let store = store();
+        store.insert(&[record("old", "2026-10-01T00:00:00Z", "o")], at("2026-10-01T00:00:00Z")).unwrap();
+        store.insert(&[record("new", "2026-10-08T00:00:00Z", "o")], at("2026-10-08T00:00:00Z")).unwrap();
+        let cutoff = at("2026-10-05T00:00:00Z");
+
+        // Without projections nothing has been processed, so nothing is deleted.
+        assert_eq!(store.delete_received_before(cutoff).unwrap(), 0);
+        // A projection that has not processed anything protects every record.
+        store.write().execute_batch("INSERT INTO projection_checkpoints VALUES ('calls', 0)").unwrap();
+        assert_eq!(store.delete_received_before(cutoff).unwrap(), 0);
+        // The slowest projection decides.
+        store.write().execute_batch("UPDATE projection_checkpoints SET last_seq = 2").unwrap();
+        store.write().execute_batch("INSERT INTO projection_checkpoints VALUES ('metrics', 1)").unwrap();
+        assert_eq!(store.delete_received_before(cutoff).unwrap(), 1);
+        assert!(store.get("old").unwrap().is_none());
+        assert!(store.get("new").unwrap().is_some());
     }
 
     #[test]
@@ -681,11 +744,14 @@ mod tests {
         let path = path.to_str().unwrap();
         {
             let store = Store::open(path, Some("256MB")).unwrap();
-            store.insert(&[call("a", "2026-10-08T10:00:00Z", "parse", "m1", None)], Utc::now()).unwrap();
+            store.insert(&[record("a", "2026-10-08T10:00:00Z", "o")], Utc::now()).unwrap();
             store.checkpoint().unwrap();
         }
         let store = Store::open(path, None).unwrap();
         assert!(store.get("a").unwrap().is_some());
+        store.insert(&[record("b", "2026-10-08T10:00:00Z", "o")], Utc::now()).unwrap();
+        let seqs: Vec<u64> = store.list(&ListCallsQuery::default()).unwrap().calls.iter().map(|c| c.seq).collect();
+        assert!(seqs[0] > seqs[1], "seq keeps increasing across restarts: {seqs:?}");
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

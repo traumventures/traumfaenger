@@ -9,7 +9,9 @@
         "test": "bun test packages"
     },
     "devDependencies": {
+        "@ai-sdk/openai-compatible": "^3.0.43",
         "@types/bun": "^1.2.0",
+        "ai": "^7.0.91",
         "typescript": "^5.9.0"
     }
 }

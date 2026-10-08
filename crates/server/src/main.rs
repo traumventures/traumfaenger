@@ -25,6 +25,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ai-ledger listening"
     );
 
+    if let Some(days) = config.retention_days {
+        tokio::spawn(enforce_retention(store.clone(), days));
+    }
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         wait_for_signal().await;
@@ -40,6 +44,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     store.checkpoint()?;
     Ok(())
+}
+
+/// Hourly: delete raw records older than the retention window.
+async fn enforce_retention(store: Arc<Store>, days: u32) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+    loop {
+        interval.tick().await;
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
+        let store = store.clone();
+        match tokio::task::spawn_blocking(move || store.delete_received_before(cutoff)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(deleted)) => tracing::info!(deleted, days, "deleted raw calls past retention"),
+            Ok(Err(error)) => tracing::error!(%error, "retention cleanup failed"),
+            Err(error) => tracing::error!(%error, "retention task panicked"),
+        }
+    }
 }
 
 async fn shutdown(mut rx: watch::Receiver<bool>) {
