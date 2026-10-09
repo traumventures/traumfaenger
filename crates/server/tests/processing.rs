@@ -244,3 +244,132 @@ async fn query_api_requires_the_query_token() {
     let missing = router.oneshot(request(Some("query-token-0123456789"), "/v1/calls/none")).await.unwrap();
     assert_eq!(missing.status(), 404);
 }
+
+fn ws_record(id: &str, segment: u32, is_final: bool) -> Exchange {
+    let mut value = json!({
+        "id": id, "segment": segment, "final": is_final, "service": "app", "operation": "voice",
+        "transport": "ws", "url": "wss://realtime.example/v1", "started_at": "2026-10-09T10:00:00Z",
+        "frames": [{ "t_ms": segment, "dir": "in", "data": format!("frame {segment}") }],
+    });
+    if is_final {
+        value["end"] = json!({ "at_ms": 100, "reason": "complete" });
+    }
+    serde_json::from_value(value).unwrap()
+}
+
+fn call_ids(store: &Store) -> Vec<String> {
+    let rows = analytics(store, "calls", "metrics=calls&group_by=call_id");
+    let mut ids: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            assert_eq!(row["calls"], 1, "one row per exchange: {row}");
+            row["call_id"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn small_windows_process_every_exchange_once() {
+    let store = Store::open(":memory:", None).unwrap();
+    store.prepare_processing().unwrap();
+    // A WebSocket exchange that (wrongly) sends two final records around
+    // three plain calls: a window must not jump past the plain calls.
+    store.insert(&[ws_record("ws", 0, true)], Utc::now()).unwrap();
+    let plain: Vec<Exchange> = conversation().into_iter().take(3).collect();
+    for exchange in plain {
+        store.insert(&[exchange], Utc::now()).unwrap();
+    }
+    store.insert(&[ws_record("ws", 1, true)], Utc::now()).unwrap();
+    while !store.process_batch(2).unwrap().caught_up {}
+    assert_eq!(call_ids(&store), ["c1", "c2", "c3", "ws"]);
+    assert_eq!(store.processing_status().unwrap().processed_seq, 5);
+}
+
+#[test]
+fn a_segment_after_the_final_record_reprocesses_the_exchange() {
+    let store = Store::open(":memory:", None).unwrap();
+    store.prepare_processing().unwrap();
+    store.insert(&[ws_record("late", 1, true)], Utc::now()).unwrap();
+    assert_eq!(store.process_batch(projection::BATCH).unwrap().processed, 1);
+    store.insert(&[ws_record("late", 0, false)], Utc::now()).unwrap();
+    assert_eq!(store.process_batch(projection::BATCH).unwrap().processed, 1, "reprocessed with the late segment");
+    assert_eq!(store.process_batch(projection::BATCH).unwrap().processed, 0);
+    assert_eq!(call_ids(&store), ["late"]);
+}
+
+#[test]
+fn rejects_implausible_start_times() {
+    let mut far = conversation().remove(0);
+    far.started_at = "+262142-12-31T23:59:59Z".parse().unwrap();
+    assert!(far.validate().unwrap_err().contains("started_at"));
+}
+
+#[test]
+fn repeated_tool_call_ids_link_to_their_own_results() {
+    // Two conversations without a session, both numbering their first tool
+    // call `functions.lookup:0`, interleaved in time.
+    let call = |args: &str| json!({ "role": "assistant", "content": null, "tool_calls": [{ "id": "functions.lookup:0", "type": "function", "function": { "name": "lookup", "arguments": args } }] });
+    let result = |text: &str| json!({ "role": "tool", "tool_call_id": "functions.lookup:0", "content": text });
+    let user = |text: &str| json!({ "role": "user", "content": text });
+    let answer_with = |args: &str| {
+        let mut value = answer(None, Some(("functions.lookup:0", "lookup")), 0.001);
+        value["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = json!(args);
+        value
+    };
+    let no_session = json!({ "session_id": null });
+    let exchanges = vec![
+        exchange("a1", "2026-10-09T10:00:00Z", json!([user("a")]), answer_with("{\"q\":\"a\"}"), no_session.clone()),
+        exchange("b1", "2026-10-09T10:00:01Z", json!([user("b")]), answer_with("{\"q\":\"b\"}"), no_session.clone()),
+        exchange(
+            "a2",
+            "2026-10-09T10:00:02Z",
+            json!([user("a"), call("{\"q\":\"a\"}"), result("ra")]),
+            answer(Some("done a"), None, 0.001),
+            no_session.clone(),
+        ),
+        exchange(
+            "b2",
+            "2026-10-09T10:00:03Z",
+            json!([user("b"), call("{\"q\":\"b\"}"), result("rb")]),
+            answer(Some("done b"), None, 0.001),
+            no_session,
+        ),
+    ];
+    let store = Store::open(":memory:", None).unwrap();
+    store.insert(&exchanges, Utc::now()).unwrap();
+    store.prepare_processing().unwrap();
+    while !store.process_batch(projection::BATCH).unwrap().caught_up {}
+    let mut rows = analytics(&store, "tools", "metrics=tool_calls,answered&group_by=call_id,result_call_id");
+    rows.sort_by_key(|row| row["call_id"].as_str().unwrap().to_owned());
+    assert_eq!(
+        rows,
+        [
+            json!({ "call_id": "a1", "result_call_id": "a2", "tool_calls": 1, "answered": 1 }),
+            json!({ "call_id": "b1", "result_call_id": "b2", "tool_calls": 1, "answered": 1 }),
+        ]
+    );
+}
+
+#[test]
+fn retention_keeps_open_exchanges_until_they_are_processed() {
+    let store = Store::open(":memory:", None).unwrap();
+    store.prepare_processing().unwrap();
+    let received = Utc::now() - chrono::Duration::days(2);
+    store.insert(&[ws_record("open", 0, false)], received).unwrap();
+    store.insert(&conversation()[..1], received).unwrap();
+    while !store.process_batch(projection::BATCH).unwrap().caught_up {}
+    // Both records are below the checkpoint, but the WebSocket exchange is
+    // still open: only the finished call goes.
+    let cutoff = Utc::now() - chrono::Duration::days(1);
+    assert_eq!(store.delete_received_before(cutoff).unwrap(), 1);
+    store.insert(&[ws_record("open", 1, true)], Utc::now()).unwrap();
+    while !store.process_batch(projection::BATCH).unwrap().caught_up {}
+    assert_eq!(call_ids(&store), ["c1", "open"]);
+    assert_eq!(store.delete_received_before(cutoff).unwrap(), 1, "processed now");
+    // A record that never finishes goes a week after the cutoff.
+    store.insert(&[ws_record("abandoned", 0, false)], Utc::now() - chrono::Duration::days(9)).unwrap();
+    while !store.process_batch(projection::BATCH).unwrap().caught_up {}
+    assert_eq!(store.delete_received_before(cutoff).unwrap(), 1);
+}

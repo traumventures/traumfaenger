@@ -93,9 +93,13 @@ fn read_usage(usage: &Value, into: &mut Usage) {
     let cached = number(usage, "cache_read_input_tokens");
     let written = number(usage, "cache_creation_input_tokens");
     if uncached.is_some() || cached.is_some() || written.is_some() {
-        into.input = sum(&[uncached, cached, written]);
+        // Field by field: a delta may repeat only some of the counts.
+        let known = into
+            .input
+            .map(|input| input.saturating_sub(into.cached.unwrap_or(0)).saturating_sub(into.cache_write.unwrap_or(0)));
         into.cached = cached.or(into.cached);
         into.cache_write = written.or(into.cache_write);
+        into.input = sum(&[uncached.or(known), into.cached, into.cache_write]);
     }
     if let Some(output) = number(usage, "output_tokens") {
         into.output = Some(output);

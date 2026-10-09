@@ -106,6 +106,7 @@ const SOURCES: &[Source] = &[
         dimensions: &[
             ("tool", "t.tool_name"),
             ("call_id", "t.call_id"),
+            ("result_call_id", "t.result_call_id"),
             ("service", "t.service"),
             ("operation", "t.operation"),
             ("session_id", "t.session_id"),
@@ -181,14 +182,15 @@ fn interval_seconds(value: &str) -> Result<u64, StoreError> {
     let (number, unit) = value.split_at(digits);
     let number: u64 = number.parse().map_err(|_| invalid("`interval` must look like `30s`, `5m`, `1h` or `1d`"))?;
     let seconds = match unit {
-        "ms" => number.div_ceil(1000),
-        "s" => number,
-        "m" => number * 60,
-        "h" => number * 3600,
-        "d" => number * 86_400,
-        "w" => number * 604_800,
+        "ms" => Some(number.div_ceil(1000)),
+        "s" => Some(number),
+        "m" => number.checked_mul(60),
+        "h" => number.checked_mul(3600),
+        "d" => number.checked_mul(86_400),
+        "w" => number.checked_mul(604_800),
         _ => return Err(invalid("`interval` must look like `30s`, `5m`, `1h` or `1d`")),
-    };
+    }
+    .unwrap_or(u64::MAX);
     if !(1..=366 * 86_400).contains(&seconds.max(1)) || number == 0 {
         return Err(invalid("`interval` must be between 1ms and 366d"));
     }
@@ -218,7 +220,7 @@ impl MetadataJoins {
         format!("m{index}")
     }
 
-    /// Keys are validated to `[A-Za-z0-9_-]`, so inlining them is safe.
+    /// Keys are validated to `[A-Za-z0-9_.-]`, so inlining them is safe.
     fn sql(&self, calls: &str) -> String {
         self.0
             .iter()
@@ -242,9 +244,9 @@ impl Source {
             }
             if key.is_empty()
                 || key.len() > 64
-                || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                || !key.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
             {
-                return Err(invalid("metadata keys may only contain letters, digits, `_` and `-`"));
+                return Err(invalid("metadata keys may only contain letters, digits, `_`, `.` and `-`"));
             }
             return Ok(format!("{}.value", joins.alias(key)));
         }

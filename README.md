@@ -26,9 +26,11 @@ clients ──WS /v1/ingest──▶ raw log: raw_exchanges + raw_frames (append
 ```
 
 - **Write side:** ingestion validates each record's envelope and appends it unparsed. It never interprets provider formats, so a parser bug can't lose data.
-- **Read side:** processing reads final records in `seq` order and writes each batch with its checkpoint in one transaction (`projection_checkpoints`, `calls@<parser version>`).
+- **Read side:** processing reads the raw log in `seq` order, 500 records at a time, and writes each window with its checkpoint in one transaction (`projection_checkpoints`, `calls@<parser version>`). Every exchange becomes exactly one `calls` row.
+  - An exchange is processed once its final record is read, from all its segments. A segment arriving after the final record reprocesses it.
+  - A parser panic stores that call as `unparsed` (`parse_reason = panic`). A window that keeps failing is retried in smaller steps; a single record that keeps panicking is skipped and logged.
   - A new parser version starts over from the beginning of the raw log and replaces the rows of every exchange it reprocesses. The processed rows of exchanges whose raw records are gone stay.
-  - Raw retention (`TRAUMFAENGER_RETENTION_DAYS`) deletes only what has been processed.
+  - Raw retention (`TRAUMFAENGER_RETENTION_DAYS`) deletes only exchanges that have been processed; segments of an exchange that never finished go a week later.
 
 ### Processing
 
@@ -46,7 +48,7 @@ clients ──WS /v1/ingest──▶ raw log: raw_exchanges + raw_frames (append
 
 **Storage.** Every distinct text (system prompt, message, tool definitions, arguments, result) is stored once in `contents`, keyed by the first 16 bytes of its BLAKE3 hash and zstd-compressed when that saves space; parts only point to it. On the first production export (5,607 calls), 58.5 MB of message text referenced 7.0 MB of distinct text, stored in 3.8 MB. Nothing counts references while writing, so a system prompt in thousands of calls is never a write hotspot; contents no part points to are swept after reprocessing.
 
-**Tool calls.** Each tool call the model makes is linked to the first later request of the same operation and session that carries its result: whether it errored, its size, and the gap between the call that requested it and the one that carried the result.
+**Tool calls.** Each tool call the model makes is linked to the first later request of the same operation and session that carries its result, preferring one that resent the call with the same arguments (ids like `functions.lookup:0` repeat across conversations). Calls without an id (Gemini) match by tool name. Recorded per link: whether it errored, its size, and the gap between the call that requested it and the one that carried the result.
 
 ## The canonical record## The canonical record
 
@@ -215,7 +217,7 @@ All responses are JSON and need `Authorization: Bearer $TRAUMFAENGER_QUERY_TOKEN
 | Source | Dimensions | Metrics |
 |---|---|---|
 | `calls` | `call_id`, `service`, `operation`, `session_id`, `gateway`, `provider`, `model`, `model_requested`, `api`, `outcome`, `finish_reason`, `transport`, `stream`, `turn_start`, `status`, `cost_source`, `parse_status`, `parse_reason`, `metadata.<key>` | `calls`, `failed_calls`, `error_rate`, `rate_limited_calls`, `sessions`, `turns`, `agent_turns`, `input_tokens`, `cached_tokens`, `cache_write_tokens`, `uncached_input_tokens`, `output_tokens`, `reasoning_tokens`, `total_tokens`, `cache_hit_rate`, `cost_usd`, `input_cost_usd`, `output_cost_usd`, `avg_cost_usd`, `unpriced_calls`, `latency_ms_{avg,p50,p95,p99,max}`, `ttft_ms_{avg,p50,p95,p99}`, `output_tokens_per_second`, `tool_calls`, `request_bytes`, `response_bytes`, `first_call`, `last_call` |
-| `tools` | `tool`, `call_id`, `service`, `operation`, `session_id`, `model`, `provider`, `result` (`ok`, `error`, `unanswered`) | `tool_calls`, `answered`, `failed`, `error_rate`, `gap_ms_{p50,p95,max}`, `arguments_bytes`, `result_bytes`, `sessions` |
+| `tools` | `tool`, `call_id`, `result_call_id`, `service`, `operation`, `session_id`, `model`, `provider`, `result` (`ok`, `error`, `unanswered`) | `tool_calls`, `answered`, `failed`, `error_rate`, `gap_ms_{p50,p95,max}`, `arguments_bytes`, `result_bytes`, `sessions` |
 | `parts` | `side`, `role`, `kind`, `tool`, `call_id`, `service`, `operation`, `session_id`, `gateway`, `provider`, `model`, `outcome`, `metadata.<key>` | `parts`, `bytes`, `distinct_contents`, `allocated_cost_usd`, `allocated_tokens`, `calls` |
 
 `allocated_cost_usd` spreads each call's input cost over its request parts by size, and its output cost over its response parts. It answers what system prompts, tool definitions, history and each tool's results cost. It is an estimate: providers bill per call.

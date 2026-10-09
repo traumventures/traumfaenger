@@ -199,10 +199,18 @@ async fn run_processing(store: Arc<Store>) {
             return;
         }
     };
+    // A failing window is retried in ever smaller steps down to one record.
+    // Errors are retried forever (the database may recover); a record whose
+    // processing keeps panicking is skipped, so it cannot stop everything
+    // behind it.
+    let mut limit = projection::BATCH;
+    let mut panics = 0;
     loop {
         let worker = store.clone();
-        match tokio::task::spawn_blocking(move || worker.process_batch(projection::BATCH)).await {
+        match tokio::task::spawn_blocking(move || worker.process_batch(limit)).await {
             Ok(Ok(progress)) => {
+                limit = projection::BATCH;
+                panics = 0;
                 if progress.caught_up {
                     if sweep_when_caught_up {
                         sweep_when_caught_up = false;
@@ -217,12 +225,27 @@ async fn run_processing(store: Arc<Store>) {
                 }
             }
             Ok(Err(error)) => {
-                tracing::error!(%error, "processing failed, retrying");
+                tracing::error!(%error, limit, "processing failed, retrying");
+                limit = (limit / 10).max(1);
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
             Err(error) => {
-                tracing::error!(%error, "processing task panicked, retrying");
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tracing::error!(%error, limit, "processing panicked, retrying");
+                if limit > 1 {
+                    limit = (limit / 10).max(1);
+                } else {
+                    panics += 1;
+                    if panics >= 3 {
+                        panics = 0;
+                        let skipper = store.clone();
+                        match tokio::task::spawn_blocking(move || skipper.skip_record()).await {
+                            Ok(Ok(seq)) => tracing::error!(?seq, "skipped a raw record that keeps panicking"),
+                            Ok(Err(error)) => tracing::error!(%error, "cannot skip the failing record"),
+                            Err(error) => tracing::error!(%error, "skipping the failing record panicked"),
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }

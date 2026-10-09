@@ -329,30 +329,43 @@ impl Store {
         Ok(Some(assemble(entries, frames)))
     }
 
-    /// Exchanges whose final record has a `seq` in `(after, ..]`, at most
-    /// `limit`, oldest first, each with the `seq` of its final record. Reads
-    /// all their segments and frames in two queries.
-    pub fn load_finished(&self, after: i64, limit: usize) -> Result<Vec<(i64, StoredExchange)>, StoreError> {
+    /// The next `limit` raw records after `after` and the finished exchanges
+    /// they touch, oldest first, each with the highest `seq` read for it.
+    /// `None` when nothing is past `after`. Reads all segments and frames in
+    /// two queries.
+    pub fn load_window(&self, after: i64, limit: usize) -> Result<Option<Window>, StoreError> {
         let connection = self.read();
-        let finals = "SELECT id FROM raw_exchanges WHERE is_final AND seq > ? ORDER BY seq LIMIT ?";
+        let (end, records): (Option<i64>, i64) = connection.query_row(
+            "SELECT max(seq), count(*) FROM (SELECT seq FROM raw_exchanges WHERE seq > ? ORDER BY seq LIMIT ?)",
+            duckdb::params![after, limit as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let Some(end) = end else { return Ok(None) };
+        // Every exchange with a record in the window that is final by its end:
+        // new exchanges, and segments that arrived after their final record.
+        // Each is read whole (all its segments up to `end`), so a later record
+        // of the same exchange just reprocesses it.
+        let ids = "SELECT DISTINCT w.id FROM raw_exchanges w WHERE w.seq > ? AND w.seq <= ? \
+             AND EXISTS (SELECT 1 FROM raw_exchanges f WHERE f.id = w.id AND f.is_final AND f.seq <= ?)";
+        let params = duckdb::params![after, end, end, end];
         let mut statement = connection.prepare(&format!(
-            "SELECT {ENTRY_COLUMNS} FROM raw_exchanges WHERE id IN ({finals}) ORDER BY id, segment"
+            "SELECT {ENTRY_COLUMNS} FROM raw_exchanges WHERE id IN ({ids}) AND seq <= ? ORDER BY id, segment"
         ))?;
-        let mut rows = statement.query(duckdb::params![after, limit as i64])?;
+        let mut rows = statement.query(params)?;
         let mut entries: Vec<LogEntry> = Vec::new();
         while let Some(row) = rows.next()? {
             entries.push(read_entry(row)?);
         }
         let mut statement = connection.prepare(&format!(
             "SELECT f.seq, f.t_ms, f.dir, f.data FROM raw_frames f WHERE f.seq IN \
-             (SELECT seq FROM raw_exchanges WHERE id IN ({finals})) ORDER BY f.seq, f.idx"
+             (SELECT seq FROM raw_exchanges WHERE id IN ({ids}) AND seq <= ?) ORDER BY f.seq, f.idx"
         ))?;
-        let mut rows = statement.query(duckdb::params![after, limit as i64])?;
+        let mut rows = statement.query(params)?;
         let mut frames: std::collections::HashMap<u64, Vec<Frame>> = std::collections::HashMap::new();
         while let Some(row) = rows.next()? {
             frames.entry(unsigned(row, 0)?).or_default().push(read_frame(row, 1)?);
         }
-        let mut out = Vec::new();
+        let mut exchanges = Vec::new();
         let mut index = 0;
         while index < entries.len() {
             let end = entries[index..]
@@ -361,15 +374,13 @@ impl Store {
                 .map_or(entries.len(), |n| index + n);
             let group: Vec<LogEntry> = entries[index..end].to_vec();
             index = end;
-            let Some(final_seq) = group.iter().filter(|entry| entry.is_final).map(|entry| entry.seq).max() else {
-                continue;
-            };
+            let last_seq = group.iter().map(|entry| entry.seq).max().unwrap_or_default();
             let exchange_frames =
                 group.iter().flat_map(|entry| frames.remove(&entry.seq).unwrap_or_default()).collect();
-            out.push((final_seq as i64, assemble(group, exchange_frames)));
+            exchanges.push((last_seq as i64, assemble(group, exchange_frames)));
         }
-        out.sort_by_key(|(seq, _)| *seq);
-        Ok(out)
+        exchanges.sort_by_key(|(seq, _)| *seq);
+        Ok(Some(Window { end, records: records as usize, exchanges }))
     }
 
     /// Raw log rows, most recently stored first, keyset-paginated on `seq`.
@@ -461,22 +472,31 @@ impl Store {
     }
 
     /// Deletes records received before `cutoff` that every projection has
-    /// already processed. Without any projection nothing counts as processed,
+    /// already processed (see below). Without any projection nothing counts as processed,
     /// so nothing is deleted: the log is what future projections will read.
     ///
     /// Deletes in chunks and releases the writer between them, so ingestion
     /// is not blocked for long. Returns how many records were deleted.
     pub fn delete_received_before(&self, cutoff: DateTime<Utc>) -> Result<usize, StoreError> {
         const CHUNK: i64 = 10_000;
+        // A record counts as processed once its exchange's final record is
+        // below every checkpoint: segments of an open WebSocket exchange fall
+        // below the checkpoint long before the exchange is processed. Records
+        // whose exchange never finished go after an extra week.
         let eligible = "received_at < make_timestamp(?) \
-             AND seq <= (SELECT coalesce(min(last_seq), 0) FROM projection_checkpoints)";
+             AND seq <= (SELECT coalesce(min(last_seq), 0) FROM projection_checkpoints) \
+             AND (id IN (SELECT id FROM raw_exchanges WHERE is_final \
+                     AND seq <= (SELECT coalesce(min(last_seq), 0) FROM projection_checkpoints)) \
+                  OR received_at < make_timestamp(?))";
+        let cutoff_micros = cutoff.timestamp_micros();
+        let orphan_micros = (cutoff - chrono::Duration::days(7)).timestamp_micros();
         let mut total = 0;
         loop {
             let mut connection = self.write();
             let transaction = connection.transaction()?;
             let upper: Option<i64> = transaction.query_row(
                 &format!("SELECT max(seq) FROM (SELECT seq FROM raw_exchanges WHERE {eligible} ORDER BY seq LIMIT ?)"),
-                duckdb::params![cutoff.timestamp_micros(), CHUNK],
+                duckdb::params![cutoff_micros, orphan_micros, CHUNK],
                 |row| row.get(0),
             )?;
             let Some(upper) = upper else { return Ok(total) };
@@ -484,11 +504,11 @@ impl Store {
                 &format!(
                     "DELETE FROM raw_frames WHERE seq IN (SELECT seq FROM raw_exchanges WHERE {eligible} AND seq <= ?)"
                 ),
-                duckdb::params![cutoff.timestamp_micros(), upper],
+                duckdb::params![cutoff_micros, orphan_micros, upper],
             )?;
             let deleted = transaction.execute(
                 &format!("DELETE FROM raw_exchanges WHERE {eligible} AND seq <= ?"),
-                duckdb::params![cutoff.timestamp_micros(), upper],
+                duckdb::params![cutoff_micros, orphan_micros, upper],
             )?;
             transaction.commit()?;
             total += deleted;
@@ -695,10 +715,22 @@ fn read_frame(row: &Row<'_>, offset: usize) -> Result<Frame, StoreError> {
 }
 
 /// One exchange from its segments (in order) and their frames.
+/// One step of processing: see [`Store::load_window`].
+pub struct Window {
+    /// The highest `seq` in the window; the next checkpoint.
+    pub end: i64,
+    /// Raw records in the window.
+    pub records: usize,
+    /// `(highest seq read, exchange)`, oldest first.
+    pub exchanges: Vec<(i64, StoredExchange)>,
+}
+
 fn assemble(entries: Vec<LogEntry>, frames: Vec<Frame>) -> StoredExchange {
     let first = &entries[0];
-    let last = &entries[entries.len() - 1];
-    let has_final = last.is_final;
+    // Normally the last segment is the only final one. Tolerate a client
+    // that sent another final or a segment after it: the highest final wins.
+    let last_final = entries.iter().rev().find(|entry| entry.is_final);
+    let has_final = last_final.is_some();
     let gapless = entries.iter().enumerate().all(|(index, entry)| entry.segment as usize == index);
     StoredExchange {
         id: first.id.clone(),
@@ -714,7 +746,7 @@ fn assemble(entries: Vec<LogEntry>, frames: Vec<Frame>) -> StoredExchange {
         complete: has_final && gapless,
         truncated: entries.iter().any(|entry| entry.truncated),
         frames,
-        end: if has_final { last.end.clone() } else { None },
+        end: last_final.and_then(|entry| entry.end.clone()),
     }
 }
 

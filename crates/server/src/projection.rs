@@ -1,8 +1,10 @@
 //! The read side: processes the raw log into calls, message parts, tool calls
 //! and deduplicated contents.
 //!
-//! Reads final records in `seq` order and writes each batch, together with its
-//! checkpoint, in one transaction, so every exchange is processed exactly once.
+//! Reads the raw log in `seq` order, a window of records at a time, and writes
+//! each window's exchanges together with the checkpoint in one transaction, so
+//! every exchange ends up as exactly one `calls` row. An exchange is processed
+//! once its final record is read; a segment arriving later reprocesses it.
 //! A new [`PARSER_VERSION`] starts over from the beginning of the raw log and
 //! replaces the rows of every exchange it reprocesses; rows of exchanges whose
 //! raw records are already gone stay as they were.
@@ -13,11 +15,12 @@
 //! prompt is in thousands of calls) therefore never become a write hotspot.
 
 use std::collections::HashSet;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use chrono::{DateTime, Duration, Utc};
 use duckdb::{appender_params_from_iter, types::Value};
 use traumfaenger_api::StoredExchange;
-use traumfaenger_process::{Call, PARSER_VERSION, PartKind, Side, process};
+use traumfaenger_process::{Call, PARSER_VERSION, Parse, PartKind, Side, process};
 
 use crate::store::{Store, StoreError, count, optional_text, text, timestamp};
 
@@ -107,35 +110,51 @@ impl Store {
         Ok(())
     }
 
-    /// Processes up to `limit` exchanges whose final record is past the checkpoint.
+    /// Processes the next `limit` raw records past the checkpoint: every
+    /// exchange they finish, plus exchanges they add a late segment to.
     pub fn process_batch(&self, limit: usize) -> Result<Progress, StoreError> {
-        let after: i64 = self
-            .read()
-            .query_row("SELECT last_seq FROM projection_checkpoints WHERE projection = ?", [checkpoint_name()], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
-        let loaded = self.load_finished(after, limit)?;
-        let Some(&(last_seq, _)) = loaded.last() else { return Ok(Progress { processed: 0, caught_up: true }) };
-        let first_seq = loaded.iter().map(|(seq, _)| *seq).min().unwrap_or(last_seq);
-        let count = loaded.len();
-        let processed: Vec<(i64, StoredExchange, Call)> = loaded
+        let after = self.checkpoint_seq()?;
+        let Some(window) = self.load_window(after, limit)? else {
+            return Ok(Progress { processed: 0, caught_up: true });
+        };
+        let count = window.exchanges.len();
+        let processed: Vec<(i64, StoredExchange, Call)> = window
+            .exchanges
             .into_iter()
             .map(|(seq, exchange)| {
-                let call = process(&exchange);
+                let call = process_guarded(&exchange);
                 (seq, exchange, call)
             })
             .collect();
-        self.write_batch(&processed, first_seq, last_seq)?;
-        Ok(Progress { processed: count, caught_up: count < limit })
+        self.write_batch(&processed, window.end)?;
+        Ok(Progress { processed: count, caught_up: window.records < limit })
     }
 
-    fn write_batch(
-        &self,
-        batch: &[(i64, StoredExchange, Call)],
-        first_seq: i64,
-        last_seq: i64,
-    ) -> Result<(), StoreError> {
+    /// Moves the checkpoint past the next raw record without processing it.
+    /// Last resort for a record that keeps failing; returns its `seq`.
+    pub fn skip_record(&self) -> Result<Option<i64>, StoreError> {
+        let after = self.checkpoint_seq()?;
+        let connection = self.write();
+        let next: Option<i64> =
+            connection.query_row("SELECT min(seq) FROM raw_exchanges WHERE seq > ?", [after], |row| row.get(0))?;
+        if let Some(seq) = next {
+            connection.execute(
+                "UPDATE projection_checkpoints SET last_seq = ? WHERE projection = ?",
+                duckdb::params![seq, checkpoint_name()],
+            )?;
+        }
+        Ok(next)
+    }
+
+    fn checkpoint_seq(&self) -> Result<i64, StoreError> {
+        Ok(self.read().query_row(
+            "SELECT last_seq FROM projection_checkpoints WHERE projection = ?",
+            [checkpoint_name()],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn write_batch(&self, batch: &[(i64, StoredExchange, Call)], checkpoint: i64) -> Result<(), StoreError> {
         let mut connection = self.write();
         let transaction = connection.transaction()?;
         transaction.execute_batch(
@@ -145,8 +164,8 @@ impl Store {
              CREATE TEMP TABLE IF NOT EXISTS staging_contents AS SELECT * FROM contents LIMIT 0;
              CREATE TEMP TABLE IF NOT EXISTS staging_metadata AS SELECT * FROM call_metadata LIMIT 0;
              CREATE TEMP TABLE IF NOT EXISTS staging_results (call_id VARCHAR, started_at TIMESTAMP, \
-                 tool_call_id VARCHAR, operation VARCHAR, session_id VARCHAR, content HUGEINT, bytes INTEGER, \
-                 is_error BOOLEAN);
+                 tool_call_id VARCHAR, operation VARCHAR, session_id VARCHAR, arguments HUGEINT, content HUGEINT, \
+                 bytes INTEGER, is_error BOOLEAN);
              DELETE FROM temp.staging_calls; DELETE FROM temp.staging_parts; DELETE FROM temp.staging_tool_calls;
              DELETE FROM temp.staging_contents; DELETE FROM temp.staging_results;
              DELETE FROM temp.staging_metadata;",
@@ -181,8 +200,9 @@ impl Store {
                         text(value),
                     ]))?;
                 }
-                let ended_at =
-                    exchange.end.as_ref().map(|end| exchange.started_at + Duration::milliseconds(end.at_ms as i64));
+                let ended_at = exchange.end.as_ref().and_then(|end| {
+                    exchange.started_at.checked_add_signed(Duration::milliseconds(i64::try_from(end.at_ms).ok()?))
+                });
                 let mut request_bytes = 0u64;
                 let mut response_bytes = 0u64;
                 let mut part_row = |side: &str,
@@ -226,6 +246,14 @@ impl Store {
                         false,
                     )?;
                 }
+                // The arguments each resent tool call had, to tell apart tool
+                // calls that share an id.
+                let resent: std::collections::HashMap<&str, [u8; 16]> = call
+                    .parts
+                    .iter()
+                    .filter(|part| part.side == Side::Request && part.kind == PartKind::ToolCall)
+                    .filter_map(|part| Some((part.tool_call_id.as_deref()?, part.content.hash)))
+                    .collect();
                 for part in &call.parts {
                     content(part.content.hash, &part.content.text)?;
                     let bytes = part.content.text.len();
@@ -269,7 +297,7 @@ impl Store {
                     }
                     if part.kind == PartKind::ToolResult
                         && part.side == Side::Request
-                        && let Some(tool_call_id) = &part.tool_call_id
+                        && let Some(tool_call_id) = part.tool_call_id.as_ref().or(part.tool_name.as_ref())
                     {
                         results.append_row(appender_params_from_iter([
                             text(&exchange.id),
@@ -277,6 +305,9 @@ impl Store {
                             text(tool_call_id),
                             text(&exchange.operation),
                             optional_text(exchange.session_id.as_deref()),
+                            resent
+                                .get(tool_call_id.as_str())
+                                .map_or(Value::Null, |hash| Value::HugeInt(hash_value(*hash))),
                             Value::HugeInt(hash_value(part.content.hash)),
                             Value::Int(bytes as i32),
                             Value::Boolean(part.is_error),
@@ -298,22 +329,28 @@ impl Store {
             contents.flush()?;
         }
 
-        // Replace earlier rows of these exchanges (reprocessing after a parser
-        // change). `raw_seq` only grows, so block statistics skip everything
-        // outside the batch's range.
-        for table in ["call_parts", "tool_calls", "call_metadata"] {
-            transaction.execute(
-                &format!(
-                    "DELETE FROM {table} WHERE raw_seq BETWEEN ? AND ? \
-                     AND call_id IN (SELECT id FROM temp.staging_calls)"
-                ),
-                [first_seq, last_seq],
-            )?;
-        }
-        transaction.execute(
-            "DELETE FROM calls WHERE raw_seq BETWEEN ? AND ? AND id IN (SELECT id FROM temp.staging_calls)",
-            [first_seq, last_seq],
+        // Replace the rows of exchanges processed before (a parser change, or
+        // a segment that arrived after the final record). All rows of one
+        // call share its `raw_seq`, so the range lets block statistics skip
+        // everything else.
+        let (low, high): (Option<i64>, Option<i64>) = transaction.query_row(
+            "SELECT min(raw_seq), max(raw_seq) FROM calls WHERE id IN (SELECT id FROM temp.staging_calls)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if let (Some(low), Some(high)) = (low, high) {
+            for (table, id) in
+                [("call_parts", "call_id"), ("tool_calls", "call_id"), ("call_metadata", "call_id"), ("calls", "id")]
+            {
+                transaction.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE raw_seq BETWEEN ? AND ? \
+                         AND {id} IN (SELECT id FROM temp.staging_calls)"
+                    ),
+                    [low, high],
+                )?;
+            }
+        }
         transaction.execute_batch(
             "INSERT INTO calls SELECT * FROM temp.staging_calls ORDER BY raw_seq;
              INSERT INTO call_parts SELECT * FROM temp.staging_parts ORDER BY raw_seq, side, message, idx;
@@ -321,24 +358,18 @@ impl Store {
              INSERT INTO call_metadata SELECT * FROM temp.staging_metadata ORDER BY raw_seq, key;
              INSERT OR IGNORE INTO contents SELECT * FROM temp.staging_contents;",
         )?;
-        // Each tool call is answered by the first later request that carries
-        // its result (agents resend the conversation, so later ones repeat it).
-        transaction.execute_batch(
-            "UPDATE tool_calls t SET result_call_id = r.call_id, result = r.content, result_bytes = r.bytes, \
-                 is_error = r.is_error, gap_ms = date_diff('millisecond', t.ended_at, r.started_at)
-             FROM (
-                 SELECT tool_call_id, operation, session_id, arg_min(call_id, started_at) AS call_id,
-                        min(started_at) AS started_at, arg_min(content, started_at) AS content,
-                        arg_min(bytes, started_at) AS bytes, arg_min(is_error, started_at) AS is_error
-                 FROM temp.staging_results GROUP BY ALL
-             ) r
-             WHERE t.tool_call_id = r.tool_call_id AND t.operation = r.operation
-               AND t.session_id IS NOT DISTINCT FROM r.session_id
-               AND t.result_call_id IS NULL AND r.started_at >= t.started_at;",
-        )?;
+        // Each tool call is answered by the first later call that carries its
+        // result (agents resend the conversation, so later ones repeat it).
+        // Ids are only unique per conversation (some providers number them
+        // `functions.name:0`), so every open tool call takes its own nearest
+        // result: first one whose request resent the call with the same
+        // arguments, then any. Calls without an id (Gemini) match by name.
+        for same_arguments in [true, false] {
+            transaction.execute_batch(&link_results_sql(same_arguments))?;
+        }
         transaction.execute(
             "UPDATE projection_checkpoints SET last_seq = ? WHERE projection = ?",
-            duckdb::params![last_seq, checkpoint_name()],
+            duckdb::params![checkpoint, checkpoint_name()],
         )?;
         transaction.commit()?;
         Ok(())
@@ -350,6 +381,47 @@ impl Store {
         Ok(connection
             .execute("DELETE FROM contents WHERE hash NOT IN (SELECT DISTINCT content FROM call_parts)", [])?)
     }
+}
+
+/// Links open tool calls to their nearest later result in `staging_results`.
+fn link_results_sql(same_arguments: bool) -> String {
+    let arguments = if same_arguments { " AND o.arguments = r.arguments" } else { "" };
+    format!(
+        "UPDATE tool_calls t SET result_call_id = m.result_call_id, result = m.content, \
+             result_bytes = m.bytes, is_error = m.is_error, gap_ms = m.gap_ms
+         FROM (
+             SELECT o.call_id, o.match_key, r.call_id AS result_call_id, r.content, r.bytes, r.is_error,
+                    date_diff('millisecond', o.ended_at, r.started_at) AS gap_ms
+             FROM (
+                 SELECT call_id, coalesce(tool_call_id, tool_name) AS match_key, operation,
+                        coalesce(session_id, '') AS session_key, arguments, started_at, ended_at
+                 FROM tool_calls
+                 WHERE result_call_id IS NULL AND coalesce(tool_call_id, tool_name) IS NOT NULL
+                   AND started_at <= (SELECT max(started_at) FROM temp.staging_results)
+                   AND started_at >= (SELECT min(started_at) FROM temp.staging_results) - INTERVAL 1 DAY
+             ) o
+             ASOF JOIN (
+                 SELECT call_id, tool_call_id AS match_key, operation, coalesce(session_id, '') AS session_key,
+                        arguments, started_at, content, bytes, is_error
+                 FROM temp.staging_results
+             ) r
+             ON o.match_key = r.match_key AND o.operation = r.operation AND o.session_key = r.session_key{arguments}
+                AND r.started_at > o.started_at
+         ) m
+         WHERE t.call_id = m.call_id AND coalesce(t.tool_call_id, t.tool_name) = m.match_key
+           AND t.result_call_id IS NULL;"
+    )
+}
+
+/// [`process`], but a parser panic yields an `unparsed` call (read without
+/// its frames) instead of stopping all processing at this exchange.
+fn process_guarded(exchange: &StoredExchange) -> Call {
+    catch_unwind(AssertUnwindSafe(|| process(exchange))).unwrap_or_else(|_| {
+        tracing::error!(id = %exchange.id, "parser panicked, storing the call as unparsed");
+        let mut call = process(&StoredExchange { frames: Vec::new(), ..exchange.clone() });
+        call.parse = Parse::Unparsed("panic".into());
+        call
+    })
 }
 
 fn call_row(

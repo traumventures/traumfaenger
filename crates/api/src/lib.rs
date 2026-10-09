@@ -94,6 +94,9 @@ pub mod limits {
     pub const MAX_METADATA_VALUE_LEN: usize = 512;
     /// Upper bound for every `t_ms` and `at_ms`: one day.
     pub const MAX_DURATION_MS: u64 = 86_400_000;
+    /// Plausible range of `started_at`, so derived times never overflow.
+    pub const MIN_STARTED_AT_YEAR: i32 = 2000;
+    pub const MAX_STARTED_AT_YEAR: i32 = 2199;
     /// Default and maximum page size of the list endpoint.
     pub const DEFAULT_LIST_LIMIT: u32 = 100;
     pub const MAX_LIST_LIMIT: u32 = 1_000;
@@ -288,6 +291,15 @@ impl Exchange {
         }
         if self.segment > limits::MAX_SEGMENT {
             return Err(format!("segment must be at most {}", limits::MAX_SEGMENT));
+        }
+        if !(limits::MIN_STARTED_AT_YEAR..=limits::MAX_STARTED_AT_YEAR)
+            .contains(&chrono::Datelike::year(&self.started_at))
+        {
+            return Err(format!(
+                "started_at must be between the years {} and {}",
+                limits::MIN_STARTED_AT_YEAR,
+                limits::MAX_STARTED_AT_YEAR
+            ));
         }
         if self.status.is_some_and(|status| !(100..=599).contains(&status)) {
             return Err("status must be between 100 and 599".into());

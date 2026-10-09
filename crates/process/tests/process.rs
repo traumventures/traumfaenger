@@ -185,8 +185,9 @@ fn anthropic_stream_through_langdock_is_priced() {
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":2}\"}}",
         ),
         (
+            // Repeats `input_tokens` without the cache counts.
             99,
-            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":30}}",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":30}}",
         ),
         (100, "event: message_stop\ndata: {\"type\":\"message_stop\"}"),
     ];
