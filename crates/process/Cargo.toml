@@ -1,0 +1,20 @@
+[package]
+name = "traumfaenger-process"
+description = "Turns recorded AI provider exchanges into normalized calls, message parts and tool calls."
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+traumfaenger-api.workspace = true
+blake3 = "1"
+serde.workspace = true
+serde_json.workspace = true
+flate2 = "1"
+
+[dev-dependencies]
+chrono.workspace = true
+
+[[bin]]
+name = "traumfaenger-replay"
+path = "src/bin/replay.rs"

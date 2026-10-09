@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/api", "crates/client", "crates/rig", "crates/server"]
+members = ["crates/api", "crates/client", "crates/process", "crates/rig", "crates/server"]
 
 [workspace.package]
 edition = "2024"
@@ -10,6 +10,7 @@ version = "0.1.0"
 [workspace.dependencies]
 traumfaenger-api = { path = "crates/api" }
 traumfaenger-client = { path = "crates/client" }
+traumfaenger-process = { path = "crates/process" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
