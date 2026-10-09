@@ -31,8 +31,9 @@ use traumfaenger_api::{
     SummaryQuery, SummaryResponse, SummaryRow, Transport, limits,
 };
 
-/// Ordered schema migrations. Append only once released; nothing is deployed yet.
-const MIGRATIONS: &[&str] = &["CREATE SEQUENCE raw_seq START 1;
+/// Ordered schema migrations. Released ones are never edited, only appended to.
+const MIGRATIONS: &[&str] = &[
+    "CREATE SEQUENCE raw_seq START 1;
     CREATE TABLE raw_exchanges (
         seq BIGINT NOT NULL DEFAULT nextval('raw_seq'),
         id VARCHAR NOT NULL,
@@ -66,7 +67,95 @@ const MIGRATIONS: &[&str] = &["CREATE SEQUENCE raw_seq START 1;
     CREATE TABLE projection_checkpoints (
         projection VARCHAR PRIMARY KEY,
         last_seq BIGINT NOT NULL
-    )"];
+    )",
+    // Read side: processed calls (see projection.rs). Every text is stored
+    // once in `contents`, keyed by the first 16 bytes of its BLAKE3 hash.
+    "CREATE TABLE calls (
+        id VARCHAR NOT NULL,
+        raw_seq BIGINT NOT NULL,
+        started_at TIMESTAMP NOT NULL,
+        ended_at TIMESTAMP,
+        service VARCHAR NOT NULL,
+        operation VARCHAR NOT NULL,
+        session_id VARCHAR,
+        metadata VARCHAR NOT NULL,
+        turn_start BOOLEAN NOT NULL,
+        transport VARCHAR NOT NULL,
+        status INTEGER,
+        api VARCHAR NOT NULL,
+        gateway VARCHAR NOT NULL,
+        provider VARCHAR,
+        model_requested VARCHAR,
+        model VARCHAR,
+        stream BOOLEAN NOT NULL,
+        outcome VARCHAR NOT NULL,
+        error VARCHAR,
+        finish_reason VARCHAR,
+        input_tokens BIGINT,
+        cached_tokens BIGINT,
+        cache_write_tokens BIGINT,
+        output_tokens BIGINT,
+        reasoning_tokens BIGINT,
+        cost_usd DOUBLE,
+        input_cost_usd DOUBLE,
+        output_cost_usd DOUBLE,
+        cost_source VARCHAR NOT NULL,
+        latency_ms BIGINT,
+        ttft_ms BIGINT,
+        tool_calls INTEGER NOT NULL,
+        request_bytes BIGINT NOT NULL,
+        response_bytes BIGINT NOT NULL,
+        parse_status VARCHAR NOT NULL,
+        parse_reason VARCHAR,
+        parser_version INTEGER NOT NULL
+    );
+    CREATE TABLE call_parts (
+        call_id VARCHAR NOT NULL,
+        raw_seq BIGINT NOT NULL,
+        side VARCHAR NOT NULL,
+        message INTEGER NOT NULL,
+        idx INTEGER NOT NULL,
+        role VARCHAR NOT NULL,
+        kind VARCHAR NOT NULL,
+        content HUGEINT NOT NULL,
+        bytes INTEGER NOT NULL,
+        tool_call_id VARCHAR,
+        tool_name VARCHAR,
+        is_error BOOLEAN NOT NULL
+    );
+    CREATE TABLE call_metadata (
+        call_id VARCHAR NOT NULL,
+        raw_seq BIGINT NOT NULL,
+        key VARCHAR NOT NULL,
+        value VARCHAR NOT NULL
+    );
+    CREATE TABLE contents (
+        hash HUGEINT PRIMARY KEY,
+        bytes INTEGER NOT NULL,
+        codec UTINYINT NOT NULL,
+        data BLOB NOT NULL
+    );
+    CREATE TABLE tool_calls (
+        call_id VARCHAR NOT NULL,
+        raw_seq BIGINT NOT NULL,
+        tool_call_id VARCHAR,
+        tool_name VARCHAR,
+        arguments HUGEINT NOT NULL,
+        arguments_bytes INTEGER NOT NULL,
+        started_at TIMESTAMP NOT NULL,
+        ended_at TIMESTAMP,
+        service VARCHAR NOT NULL,
+        operation VARCHAR NOT NULL,
+        session_id VARCHAR,
+        model VARCHAR,
+        provider VARCHAR,
+        result_call_id VARCHAR,
+        result HUGEINT,
+        result_bytes INTEGER,
+        is_error BOOLEAN,
+        gap_ms BIGINT
+    )",
+];
 
 /// Columns written on ingestion, in this order. `seq` takes its default.
 const INSERT_COLUMNS: &str = "id, segment, is_final, received_at, service, operation, session_id, \
@@ -146,11 +235,11 @@ impl Store {
         Ok(Self { writer: Mutex::new(connection), reader: Mutex::new(reader) })
     }
 
-    fn write(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn write(&self) -> MutexGuard<'_, Connection> {
         lock(&self.writer)
     }
 
-    fn read(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn read(&self) -> MutexGuard<'_, Connection> {
         lock(&self.reader)
     }
 
@@ -226,36 +315,61 @@ impl Store {
         while let Some(row) = rows.next()? {
             entries.push(read_entry(row)?);
         }
-        let Some(first) = entries.first() else { return Ok(None) };
-
+        if entries.is_empty() {
+            return Ok(None);
+        }
         let mut frames = Vec::new();
         let mut statement = connection.prepare("SELECT t_ms, dir, data FROM raw_frames WHERE seq = ? ORDER BY idx")?;
         for entry in &entries {
             let mut rows = statement.query([entry.seq as i64])?;
             while let Some(row) = rows.next()? {
-                let dir: String = row.get(1)?;
-                frames.push(Frame { t_ms: unsigned(row, 0)?, dir: parse_direction(&dir)?, data: row.get(2)? });
+                frames.push(read_frame(row, 0)?);
             }
         }
-        let last = entries.last().unwrap_or(first);
-        let has_final = last.is_final;
-        let gapless = entries.iter().enumerate().all(|(index, entry)| entry.segment as usize == index);
-        Ok(Some(StoredExchange {
-            id: first.id.clone(),
-            service: first.service.clone(),
-            operation: first.operation.clone(),
-            session_id: first.session_id.clone(),
-            metadata: first.metadata.clone(),
-            transport: first.transport,
-            url: first.url.clone(),
-            started_at: first.started_at,
-            status: entries.iter().rev().find_map(|entry| entry.status),
-            segments: entries.len() as u32,
-            complete: has_final && gapless,
-            truncated: entries.iter().any(|entry| entry.truncated),
-            frames,
-            end: if has_final { last.end.clone() } else { None },
-        }))
+        Ok(Some(assemble(entries, frames)))
+    }
+
+    /// Exchanges whose final record has a `seq` in `(after, ..]`, at most
+    /// `limit`, oldest first, each with the `seq` of its final record. Reads
+    /// all their segments and frames in two queries.
+    pub fn load_finished(&self, after: i64, limit: usize) -> Result<Vec<(i64, StoredExchange)>, StoreError> {
+        let connection = self.read();
+        let finals = "SELECT id FROM raw_exchanges WHERE is_final AND seq > ? ORDER BY seq LIMIT ?";
+        let mut statement = connection.prepare(&format!(
+            "SELECT {ENTRY_COLUMNS} FROM raw_exchanges WHERE id IN ({finals}) ORDER BY id, segment"
+        ))?;
+        let mut rows = statement.query(duckdb::params![after, limit as i64])?;
+        let mut entries: Vec<LogEntry> = Vec::new();
+        while let Some(row) = rows.next()? {
+            entries.push(read_entry(row)?);
+        }
+        let mut statement = connection.prepare(&format!(
+            "SELECT f.seq, f.t_ms, f.dir, f.data FROM raw_frames f WHERE f.seq IN \
+             (SELECT seq FROM raw_exchanges WHERE id IN ({finals})) ORDER BY f.seq, f.idx"
+        ))?;
+        let mut rows = statement.query(duckdb::params![after, limit as i64])?;
+        let mut frames: std::collections::HashMap<u64, Vec<Frame>> = std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            frames.entry(unsigned(row, 0)?).or_default().push(read_frame(row, 1)?);
+        }
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < entries.len() {
+            let end = entries[index..]
+                .iter()
+                .position(|entry| entry.id != entries[index].id)
+                .map_or(entries.len(), |n| index + n);
+            let group: Vec<LogEntry> = entries[index..end].to_vec();
+            index = end;
+            let Some(final_seq) = group.iter().filter(|entry| entry.is_final).map(|entry| entry.seq).max() else {
+                continue;
+            };
+            let exchange_frames =
+                group.iter().flat_map(|entry| frames.remove(&entry.seq).unwrap_or_default()).collect();
+            out.push((final_seq as i64, assemble(group, exchange_frames)));
+        }
+        out.sort_by_key(|(seq, _)| *seq);
+        Ok(out)
     }
 
     /// Raw log rows, most recently stored first, keyset-paginated on `seq`.
@@ -549,20 +663,20 @@ fn row_values(record: &Exchange, received_at: DateTime<Utc>) -> [Value; 19] {
     ]
 }
 
-fn timestamp(value: DateTime<Utc>) -> Value {
+pub(crate) fn timestamp(value: DateTime<Utc>) -> Value {
     Value::Timestamp(TimeUnit::Microsecond, value.timestamp_micros())
 }
 
-fn text(value: &str) -> Value {
+pub(crate) fn text(value: &str) -> Value {
     Value::Text(value.to_owned())
 }
 
-fn optional_text(value: Option<&str>) -> Value {
+pub(crate) fn optional_text(value: Option<&str>) -> Value {
     value.map_or(Value::Null, text)
 }
 
 /// Durations and byte counts are bounded by the limits, far below `i64::MAX`.
-fn count(value: u64) -> Value {
+pub(crate) fn count(value: u64) -> Value {
     Value::BigInt(i64::try_from(value).unwrap_or(i64::MAX))
 }
 
@@ -573,6 +687,35 @@ fn unsigned(row: &Row<'_>, index: usize) -> Result<u64, StoreError> {
 
 fn small<T: TryFrom<i32>>(value: Option<i32>, name: &str) -> Result<Option<T>, StoreError> {
     value.map(|value| T::try_from(value).map_err(|_| StoreError::Corrupt(format!("{name} {value}")))).transpose()
+}
+
+fn read_frame(row: &Row<'_>, offset: usize) -> Result<Frame, StoreError> {
+    let dir: String = row.get(offset + 1)?;
+    Ok(Frame { t_ms: unsigned(row, offset)?, dir: parse_direction(&dir)?, data: row.get(offset + 2)? })
+}
+
+/// One exchange from its segments (in order) and their frames.
+fn assemble(entries: Vec<LogEntry>, frames: Vec<Frame>) -> StoredExchange {
+    let first = &entries[0];
+    let last = &entries[entries.len() - 1];
+    let has_final = last.is_final;
+    let gapless = entries.iter().enumerate().all(|(index, entry)| entry.segment as usize == index);
+    StoredExchange {
+        id: first.id.clone(),
+        service: first.service.clone(),
+        operation: first.operation.clone(),
+        session_id: first.session_id.clone(),
+        metadata: first.metadata.clone(),
+        transport: first.transport,
+        url: first.url.clone(),
+        started_at: first.started_at,
+        status: entries.iter().rev().find_map(|entry| entry.status),
+        segments: entries.len() as u32,
+        complete: has_final && gapless,
+        truncated: entries.iter().any(|entry| entry.truncated),
+        frames,
+        end: if has_final { last.end.clone() } else { None },
+    }
 }
 
 fn read_entry(row: &Row<'_>) -> Result<LogEntry, StoreError> {

@@ -11,4 +11,11 @@ export {
 } from "./recorder.ts";
 export { defaultSocketFactory, type Encoding, type IngestSocket, type SocketFactory } from "./sender.ts";
 export { prepareData, SseSplitter, splitEvents } from "./text.ts";
-export { TraumfaengerError, type ClientOptions, QueryClient, toSearch } from "./transport.ts";
+export {
+    type AnalyticsQuery,
+    type AnalyticsSource,
+    TraumfaengerError,
+    type ClientOptions,
+    QueryClient,
+    toSearch,
+} from "./transport.ts";

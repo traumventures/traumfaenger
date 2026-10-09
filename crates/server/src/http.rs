@@ -27,6 +27,7 @@ use traumfaenger_api::{
 };
 
 use crate::{
+    details,
     ingest::{self, BatchError, Encoding},
     store::{Store, StoreError},
 };
@@ -54,12 +55,18 @@ pub fn ingest_router(store: SharedStore, token: Option<String>) -> Router {
     finish(api, "ingest")
 }
 
-/// Read-only API: list the raw log, fetch exchanges, summarise.
+/// Read-only API: the raw log, analytics over processed calls, call and
+/// session details, stored texts and processing status.
 pub fn query_router(store: SharedStore, token: Option<String>) -> Router {
     let api = Router::new()
         .route(routes::LIST_EXCHANGES, get(list))
         .route(routes::GET_EXCHANGE, get(get_exchange))
         .route(routes::SUMMARY, get(summary))
+        .route(routes::ANALYTICS, get(analytics))
+        .route(routes::CALL, get(call))
+        .route(routes::SESSION, get(session))
+        .route(routes::CONTENT, get(content))
+        .route(routes::PROCESSING, get(processing))
         .route_layer(middleware::from_fn_with_state(Arc::new(token), require_bearer))
         .with_state(store);
     finish(api, "query")
@@ -203,9 +210,85 @@ async fn get_exchange(State(store): State<SharedStore>, id: Result<Path<String>,
     };
     run(store, move |store| -> Result<_, HandlerError> {
         let exchange = store.get(&id)?;
-        exchange.ok_or(HandlerError::NotFound(id))
+        exchange.ok_or_else(|| HandlerError::NotFound(format!("no exchange with id `{id}`")))
     })
     .await
+}
+
+async fn analytics(
+    State(store): State<SharedStore>,
+    source: Result<Path<String>, PathRejection>,
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
+) -> Response {
+    let (Ok(Path(source)), Ok(Query(params))) = (source, query) else {
+        return error(ErrorCode::InvalidRequest, "invalid source or query string");
+    };
+    run(store, move |store| store.analytics(&source, &params)).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DetailQuery {
+    max_chars: Option<usize>,
+    new_only: Option<bool>,
+}
+
+impl DetailQuery {
+    fn max_chars(&self) -> Result<usize, HandlerError> {
+        match self.max_chars {
+            None => Ok(details::DEFAULT_MAX_CHARS),
+            Some(chars) if (1..=details::MAX_MAX_CHARS).contains(&chars) => Ok(chars),
+            Some(_) => Err(HandlerError::Store(StoreError::Invalid(format!(
+                "`max_chars` must be between 1 and {}",
+                details::MAX_MAX_CHARS
+            )))),
+        }
+    }
+}
+
+async fn call(
+    State(store): State<SharedStore>,
+    id: Result<Path<String>, PathRejection>,
+    query: Result<Query<DetailQuery>, QueryRejection>,
+) -> Response {
+    let (Ok(Path(id)), Ok(Query(query))) = (id, query) else {
+        return error(ErrorCode::InvalidRequest, "invalid call id or query string");
+    };
+    run(store, move |store| -> Result<_, HandlerError> {
+        let call = store.call(&id, query.max_chars()?)?;
+        call.ok_or_else(|| HandlerError::NotFound(format!("no processed call with id `{id}`")))
+    })
+    .await
+}
+
+async fn session(
+    State(store): State<SharedStore>,
+    id: Result<Path<String>, PathRejection>,
+    query: Result<Query<DetailQuery>, QueryRejection>,
+) -> Response {
+    let (Ok(Path(id)), Ok(Query(query))) = (id, query) else {
+        return error(ErrorCode::InvalidRequest, "invalid session id or query string");
+    };
+    run(store, move |store| -> Result<_, HandlerError> {
+        let session = store.session(&id, query.max_chars()?, query.new_only.unwrap_or(true))?;
+        session.ok_or_else(|| HandlerError::NotFound(format!("no calls in session `{id}`")))
+    })
+    .await
+}
+
+async fn content(State(store): State<SharedStore>, hash: Result<Path<String>, PathRejection>) -> Response {
+    let Ok(Path(hash)) = hash else {
+        return error(ErrorCode::InvalidRequest, "invalid content hash in path");
+    };
+    run(store, move |store| -> Result<_, HandlerError> {
+        let content = store.content(&hash)?;
+        content.ok_or_else(|| HandlerError::NotFound(format!("no content with hash `{hash}`")))
+    })
+    .await
+}
+
+async fn processing(State(store): State<SharedStore>) -> Response {
+    run(store, |store| store.processing_status()).await
 }
 
 async fn summary(State(store): State<SharedStore>, query: Result<Query<SummaryQuery>, QueryRejection>) -> Response {
@@ -236,7 +319,7 @@ where
     match tokio::task::spawn_blocking(move || operation(&store)).await {
         Ok(Ok(value)) => Json(value).into_response(),
         Ok(Err(failure)) => match failure.into() {
-            HandlerError::NotFound(id) => error(ErrorCode::NotFound, format!("no exchange with id `{id}`")),
+            HandlerError::NotFound(message) => error(ErrorCode::NotFound, message),
             HandlerError::Store(StoreError::Invalid(message)) => error(ErrorCode::InvalidRequest, message),
             HandlerError::Store(failure) => {
                 tracing::error!(error = %failure, "store operation failed");

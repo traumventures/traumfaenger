@@ -7,8 +7,10 @@
 //!    canonical shape, [`Exchange`]: an ordered list of timestamped [`Frame`]s
 //!    as they went over the wire, plus the context that is not on the wire.
 //!    The server appends them unparsed to its raw log.
-//! 2. **Processing** (later): projections extract models, usage, cost,
-//!    messages, tool calls and timings from the raw log into derived tables.
+//! 2. **Processing**: the server parses the raw log into calls (model,
+//!    provider, outcome, usage, cost, timings), message parts and tool calls,
+//!    storing every distinct text once. The query API serves analytics over
+//!    them ([`routes::ANALYTICS`]), session trajectories and the raw log.
 //!
 //! Clients send exchanges over a WebSocket ([`routes::INGEST_WS`]) whose
 //! encoding, JSON or MessagePack, is negotiated as a subprotocol (see
@@ -42,6 +44,18 @@ pub mod routes {
     pub const GET_EXCHANGE: &str = "/v1/exchanges/{id}";
     /// Query listener: `GET` collection statistics grouped by dimensions.
     pub const SUMMARY: &str = "/v1/summary";
+    /// Query listener: `GET` metrics over processed data. `{source}` is
+    /// `calls`, `tools` or `parts`; see [`crate::AnalyticsResponse`].
+    pub const ANALYTICS: &str = "/v1/analytics/{source}";
+    /// Query listener: `GET` one processed call with its message parts.
+    pub const CALL: &str = "/v1/calls/{id}";
+    /// Query listener: `GET` every call of a session in order, with the parts
+    /// each call added to the conversation.
+    pub const SESSION: &str = "/v1/sessions/{id}";
+    /// Query listener: `GET` one stored text by its hash.
+    pub const CONTENT: &str = "/v1/contents/{hash}";
+    /// Query listener: `GET` processing progress and parse coverage.
+    pub const PROCESSING: &str = "/v1/processing";
 }
 
 /// WebSocket subprotocols of the ingestion socket. The client offers them in
@@ -691,6 +705,149 @@ pub enum ErrorCode {
     MethodNotAllowed,
     PayloadTooLarge,
     Internal,
+}
+
+/// Rows of an analytics query: one object per group (and time bucket), with
+/// the requested dimensions and metrics as keys. Shaped for Grafana's Infinity
+/// data source and any other client that reads JSON tables.
+///
+/// Query parameters:
+/// - `metrics` (required): comma-separated metric names of the source.
+/// - `group_by`: comma-separated dimension names; `metadata.<key>` groups by a
+///   metadata value (calls and parts).
+/// - `interval`: bucket width such as `30s`, `5m`, `1h`, `1d` (Grafana's
+///   `$__interval` works as is); adds a `time` column (RFC 3339, bucket start).
+/// - `from` (inclusive), `to` (exclusive): RFC 3339 or epoch milliseconds
+///   (Grafana's `${__from}` / `${__to}`), on the call start.
+/// - `order`: a requested metric, sorted descending; default is `time`
+///   ascending with an interval, else the first metric descending.
+/// - `limit`: 1–10000 rows, default 1000.
+/// - any dimension (or `metadata.<key>`) as a filter: `model=a,b` keeps rows
+///   whose model is `a` or `b`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+pub struct AnalyticsResponse {
+    pub source: String,
+    #[ts(type = "Array<Record<string, string | number | boolean | null>>")]
+    pub rows: Vec<BTreeMap<String, serde_json::Value>>,
+    /// More rows matched than `limit`.
+    pub truncated: bool,
+}
+
+/// One part of one message of a processed call.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+pub struct CallPart {
+    /// `request` or `response`.
+    pub side: String,
+    /// Message position within its side; `-1` for the tool definitions.
+    pub message: i32,
+    pub index: i32,
+    /// `system`, `user`, `assistant` or `tool`.
+    pub role: String,
+    /// `text`, `reasoning`, `tool_call`, `tool_result`, `tool_definitions`,
+    /// `image`, `audio`, `file` or `other`.
+    pub kind: String,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub is_error: bool,
+    /// Hash of the text; fetch the full text from `/v1/contents/{hash}`.
+    pub hash: String,
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// The text, clipped to `max_chars` (query parameter, default 2000).
+    pub text: String,
+    pub clipped: bool,
+}
+
+/// A processed call.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+pub struct CallDetail {
+    pub id: String,
+    #[ts(type = "string")]
+    pub started_at: DateTime<Utc>,
+    pub service: String,
+    pub operation: String,
+    pub session_id: Option<String>,
+    #[ts(type = "Record<string, string>")]
+    pub metadata: BTreeMap<String, String>,
+    /// The request ends with a user message (not tool results): the call
+    /// starts an agent turn. The calls up to the next turn start are its steps.
+    pub turn_start: bool,
+    pub api: String,
+    pub gateway: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub outcome: String,
+    pub error: Option<String>,
+    pub finish_reason: Option<String>,
+    #[ts(type = "number | null")]
+    pub input_tokens: Option<i64>,
+    #[ts(type = "number | null")]
+    pub cached_tokens: Option<i64>,
+    #[ts(type = "number | null")]
+    pub output_tokens: Option<i64>,
+    #[ts(type = "number | null")]
+    pub reasoning_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
+    pub cost_source: String,
+    #[ts(type = "number | null")]
+    pub latency_ms: Option<i64>,
+    #[ts(type = "number | null")]
+    pub ttft_ms: Option<i64>,
+    pub tool_calls: i32,
+    /// `parsed`, `partial` or `unparsed`, with `parse_reason`.
+    pub parse_status: String,
+    pub parse_reason: Option<String>,
+    /// For a call: every part. In a session: only parts that earlier calls
+    /// of the session did not already carry, unless `new_only=false`.
+    pub parts: Vec<CallPart>,
+}
+
+/// A session's calls in order.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+pub struct SessionResponse {
+    pub session_id: String,
+    pub calls: Vec<CallDetail>,
+}
+
+/// A stored text.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+pub struct ContentResponse {
+    pub hash: String,
+    #[ts(type = "number")]
+    pub bytes: u64,
+    pub text: String,
+}
+
+/// Parse coverage per API, status and reason.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+pub struct ParseCoverage {
+    pub api: String,
+    pub status: String,
+    pub reason: Option<String>,
+    #[ts(type = "number")]
+    pub calls: u64,
+}
+
+/// Progress of processing the raw log.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+pub struct ProcessingStatus {
+    pub parser_version: u32,
+    /// Last raw `seq` processed.
+    #[ts(type = "number")]
+    pub processed_seq: u64,
+    /// Newest raw `seq`.
+    #[ts(type = "number")]
+    pub latest_seq: u64,
+    #[ts(type = "number")]
+    pub calls: u64,
+    /// Distinct stored texts, their size and their size on disk.
+    #[ts(type = "number")]
+    pub contents: u64,
+    #[ts(type = "number")]
+    pub content_bytes: u64,
+    #[ts(type = "number")]
+    pub content_stored_bytes: u64,
+    pub coverage: Vec<ParseCoverage>,
 }
 
 /// Body of every non-2xx HTTP response.

@@ -1,10 +1,15 @@
 import type {
+    AnalyticsResponse,
     ApiError,
+    CallDetail,
+    ContentResponse,
     ErrorCode,
     HealthResponse,
     ListQuery,
     ListResponse,
     LogEntry,
+    ProcessingStatus,
+    SessionResponse,
     StoredExchange,
     SummaryQuery,
     SummaryResponse,
@@ -79,8 +84,64 @@ export class QueryClient {
         return this.#get(`${ROUTES.summary}${toSearch(query)}`);
     }
 
+    /**
+     * Metrics over processed data; see `AnalyticsResponse` for every parameter.
+     * Dimension and `metadata.<key>` filters go into `filters`.
+     */
+    analytics(source: AnalyticsSource, query: AnalyticsQuery): Promise<AnalyticsResponse> {
+        const params = new URLSearchParams();
+        params.set("metrics", query.metrics.join(","));
+        if (query.groupBy?.length) params.set("group_by", query.groupBy.join(","));
+        if (query.interval !== undefined) params.set("interval", query.interval);
+        if (query.from !== undefined) params.set("from", toTime(query.from));
+        if (query.to !== undefined) params.set("to", toTime(query.to));
+        if (query.order !== undefined) params.set("order", query.order);
+        if (query.limit !== undefined) params.set("limit", String(query.limit));
+        for (const [name, value] of Object.entries(query.filters ?? {})) {
+            params.set(name, Array.isArray(value) ? value.join(",") : value);
+        }
+        return this.#get(`${ROUTES.analytics.replace("{source}", source)}?${params}`);
+    }
+
+    /** One processed call with its message parts, or `null` when unknown. */
+    call(id: string, options: { maxChars?: number } = {}): Promise<CallDetail | null> {
+        const search = options.maxChars === undefined ? "" : `?max_chars=${options.maxChars}`;
+        return this.#orNull(`${ROUTES.call.replace("{id}", encodeURIComponent(id))}${search}`);
+    }
+
+    /**
+     * A session's calls in order. By default each call lists only the parts it
+     * added to the conversation; `newOnly: false` lists every part.
+     */
+    session(id: string, options: { maxChars?: number; newOnly?: boolean } = {}): Promise<SessionResponse | null> {
+        const params = new URLSearchParams();
+        if (options.maxChars !== undefined) params.set("max_chars", String(options.maxChars));
+        if (options.newOnly !== undefined) params.set("new_only", String(options.newOnly));
+        const search = params.size === 0 ? "" : `?${params}`;
+        return this.#orNull(`${ROUTES.session.replace("{id}", encodeURIComponent(id))}${search}`);
+    }
+
+    /** A stored text by its hash, or `null` when unknown. */
+    content(hash: string): Promise<ContentResponse | null> {
+        return this.#orNull(ROUTES.content.replace("{hash}", encodeURIComponent(hash)));
+    }
+
+    /** Processing progress and parse coverage. */
+    processing(): Promise<ProcessingStatus> {
+        return this.#get(ROUTES.processing);
+    }
+
     health(): Promise<HealthResponse> {
         return this.#get(ROUTES.health);
+    }
+
+    async #orNull<T>(path: string): Promise<T | null> {
+        try {
+            return await this.#get<T>(path);
+        } catch (error) {
+            if (error instanceof TraumfaengerError && error.code === "not_found") return null;
+            throw error;
+        }
     }
 
     async #get<T>(path: string): Promise<T> {
@@ -109,6 +170,26 @@ export class QueryClient {
             error?.message ?? `traumfaenger GET ${path} returned ${response.status}: ${text.slice(0, 200)}`
         );
     }
+}
+
+export type AnalyticsSource = "calls" | "tools" | "parts";
+
+export interface AnalyticsQuery {
+    metrics: string[];
+    groupBy?: string[];
+    /** Bucket width such as `5m`, `1h`, `1d`; adds a `time` column. */
+    interval?: string;
+    from?: Date | string;
+    to?: Date | string;
+    /** A requested metric, sorted descending. */
+    order?: string;
+    limit?: number;
+    /** Dimension (or `metadata.<key>`) to accepted values. */
+    filters?: Record<string, string | string[]>;
+}
+
+function toTime(value: Date | string): string {
+    return value instanceof Date ? value.toISOString() : value;
 }
 
 /** Encodes a query object the way the server's `Query` extractor expects. */

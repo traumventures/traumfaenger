@@ -222,6 +222,75 @@ export type SummaryResponse = { rows: Array<SummaryRow>,
  */
 truncated: boolean, };
 
+export type AnalyticsResponse = { source: string, rows: Array<Record<string, string | number | boolean | null>>, 
+/**
+ * More rows matched than `limit`.
+ */
+truncated: boolean, };
+
+export type CallPart = { 
+/**
+ * `request` or `response`.
+ */
+side: string, 
+/**
+ * Message position within its side; `-1` for the tool definitions.
+ */
+message: number, index: number, 
+/**
+ * `system`, `user`, `assistant` or `tool`.
+ */
+role: string, 
+/**
+ * `text`, `reasoning`, `tool_call`, `tool_result`, `tool_definitions`,
+ * `image`, `audio`, `file` or `other`.
+ */
+kind: string, tool_call_id: string | null, tool_name: string | null, is_error: boolean, 
+/**
+ * Hash of the text; fetch the full text from `/v1/contents/{hash}`.
+ */
+hash: string, bytes: number, 
+/**
+ * The text, clipped to `max_chars` (query parameter, default 2000).
+ */
+text: string, clipped: boolean, };
+
+export type CallDetail = { id: string, started_at: string, service: string, operation: string, session_id: string | null, metadata: Record<string, string>, 
+/**
+ * The request ends with a user message (not tool results): the call
+ * starts an agent turn. The calls up to the next turn start are its steps.
+ */
+turn_start: boolean, api: string, gateway: string, provider: string | null, model: string | null, outcome: string, error: string | null, finish_reason: string | null, input_tokens: number | null, cached_tokens: number | null, output_tokens: number | null, reasoning_tokens: number | null, cost_usd: number | null, cost_source: string, latency_ms: number | null, ttft_ms: number | null, tool_calls: number, 
+/**
+ * `parsed`, `partial` or `unparsed`, with `parse_reason`.
+ */
+parse_status: string, parse_reason: string | null, 
+/**
+ * For a call: every part. In a session: only parts that earlier calls
+ * of the session did not already carry, unless `new_only=false`.
+ */
+parts: Array<CallPart>, };
+
+export type SessionResponse = { session_id: string, calls: Array<CallDetail>, };
+
+export type ContentResponse = { hash: string, bytes: number, text: string, };
+
+export type ParseCoverage = { api: string, status: string, reason: string | null, calls: number, };
+
+export type ProcessingStatus = { parser_version: number, 
+/**
+ * Last raw `seq` processed.
+ */
+processed_seq: number, 
+/**
+ * Newest raw `seq`.
+ */
+latest_seq: number, calls: number, 
+/**
+ * Distinct stored texts, their size and their size on disk.
+ */
+contents: number, content_bytes: number, content_stored_bytes: number, coverage: Array<ParseCoverage>, };
+
 export type HealthResponse = { status: string, 
 /**
  * Which listener answered: `ingest` or `query`.
@@ -241,6 +310,11 @@ export const ROUTES = {
     listExchanges: "/v1/exchanges",
     getExchange: "/v1/exchanges/{id}",
     summary: "/v1/summary",
+    analytics: "/v1/analytics/{source}",
+    call: "/v1/calls/{id}",
+    session: "/v1/sessions/{id}",
+    content: "/v1/contents/{hash}",
+    processing: "/v1/processing",
 } as const;
 
 export const PROTOCOLS = {

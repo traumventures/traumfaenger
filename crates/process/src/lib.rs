@@ -246,6 +246,11 @@ pub struct Call {
     pub usage: Usage,
     pub cost_usd: Option<f64>,
     pub cost_source: CostSource,
+    /// The part of `cost_usd` charged for input (prompt) and for output.
+    /// Split by the provider's own breakdown when it reports one, else by
+    /// list prices, else by tokens.
+    pub input_cost_usd: Option<f64>,
+    pub output_cost_usd: Option<f64>,
     /// Milliseconds to the first frame carrying generated content (streams only).
     pub ttft_ms: Option<u64>,
     /// Tool definitions sent with the request.
@@ -259,16 +264,14 @@ impl Call {
         self.parts.iter().filter(|part| part.side == Side::Response && part.kind == PartKind::ToolCall)
     }
 
-    /// Number of user messages in the request: the turn a call belongs to.
-    /// An agent resends the conversation, so every step of one turn has the same count.
-    pub fn user_messages(&self) -> u32 {
-        let mut seen = std::collections::BTreeSet::new();
-        for part in &self.parts {
-            if part.side == Side::Request && part.role == "user" && part.kind != PartKind::ToolResult {
-                seen.insert(part.message);
-            }
-        }
-        seen.len() as u32
+    /// Whether this call starts an agent turn: the request ends with a user
+    /// message. Calls that continue a turn end with tool results instead.
+    pub fn starts_turn(&self) -> bool {
+        self.parts
+            .iter()
+            .filter(|part| part.side == Side::Request)
+            .max_by_key(|part| (part.message, part.index))
+            .is_some_and(|last| last.role == "user" && last.kind != PartKind::ToolResult)
     }
 }
 
@@ -287,6 +290,8 @@ pub(crate) struct Parsed {
     pub finished: bool,
     pub usage: Usage,
     pub cost_usd: Option<f64>,
+    /// Share of the reported cost that was input, from the provider's breakdown.
+    pub input_share: Option<f64>,
     pub ttft_ms: Option<u64>,
     pub tools: Option<Content>,
     pub parts: Vec<Part>,
@@ -335,13 +340,22 @@ pub fn process(exchange: &StoredExchange) -> Call {
     }
     let provider = parsed.provider.take().or_else(|| default_provider(api, &gateway, &path));
     let model = parsed.model.take().or_else(|| parsed.model_requested.clone());
-    let (cost_usd, cost_source) = match parsed.cost_usd {
-        Some(cost) => (Some(cost), CostSource::Reported),
-        None => match model.as_deref().and_then(|model| pricing::price(model, &parsed.usage)) {
-            Some(cost) => (Some(cost), CostSource::Priced),
-            None => (None, CostSource::Unknown),
-        },
+    let priced = model.as_deref().and_then(|model| pricing::split(model, &parsed.usage));
+    let (cost_usd, cost_source, input_share) = match (parsed.cost_usd, priced) {
+        (Some(cost), _) => {
+            let share = parsed.input_share.or_else(|| priced.map(|(input, output)| ratio(input, input + output)));
+            (Some(cost), CostSource::Reported, share)
+        }
+        (None, Some((input, output))) => (Some(input + output), CostSource::Priced, Some(ratio(input, input + output))),
+        (None, None) => (None, CostSource::Unknown, None),
     };
+    // Without any breakdown, split by tokens.
+    let input_share = input_share.or_else(|| {
+        let (input, output) = (parsed.usage.input? as f64, parsed.usage.output.unwrap_or(0) as f64);
+        Some(ratio(input, input + output))
+    });
+    let input_cost_usd = cost_usd.zip(input_share).map(|(cost, share)| cost * share);
+    let output_cost_usd = cost_usd.zip(input_cost_usd).map(|(cost, input)| cost - input);
     Call {
         api,
         gateway,
@@ -355,6 +369,8 @@ pub fn process(exchange: &StoredExchange) -> Call {
         usage: parsed.usage,
         cost_usd,
         cost_source,
+        input_cost_usd,
+        output_cost_usd,
         ttft_ms: parsed.ttft_ms,
         tools: parsed.tools,
         parts: parsed.parts,
@@ -445,6 +461,10 @@ fn default_provider(api: Api, gateway: &str, path: &str) -> Option<String> {
         (_, Api::GeminiGenerate) => Some("google".to_owned()),
         _ => Some(gateway.to_owned()),
     }
+}
+
+fn ratio(part: f64, whole: f64) -> f64 {
+    if whole > 0.0 { part / whole } else { 0.0 }
 }
 
 fn clip(text: &str, max: usize) -> String {

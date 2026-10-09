@@ -42,7 +42,7 @@ fn openrouter_http_with_tool_round_trip() {
     });
     let response = r#"
 
-{"model":"openai/gpt-x","provider":"OpenAI","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"c2","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}],"usage":{"prompt_tokens":100,"completion_tokens":20,"cost":0.0012,"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":0},"completion_tokens_details":{"reasoning_tokens":5}}}"#;
+{"model":"openai/gpt-x","provider":"OpenAI","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"c2","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}],"usage":{"prompt_tokens":100,"completion_tokens":20,"cost":0.0012,"cost_details":{"upstream_inference_prompt_cost":0.0009,"upstream_inference_completions_cost":0.0003},"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":0},"completion_tokens_details":{"reasoning_tokens":5}}}"#;
     let call = process(&exchange("http", OPENROUTER, Some(200), request, &[(900, response)], done(900)));
 
     assert_eq!(call.api, Api::OpenAiChat);
@@ -56,12 +56,14 @@ fn openrouter_http_with_tool_round_trip() {
         (Some(100), Some(80), Some(20), Some(5))
     );
     assert_eq!((call.cost_usd, call.cost_source), (Some(0.0012), CostSource::Reported));
+    assert!((call.input_cost_usd.unwrap() - 0.0009).abs() < 1e-12);
+    assert!((call.output_cost_usd.unwrap() - 0.0003).abs() < 1e-12);
     assert!(call.tools.is_some());
     let result = call.parts.iter().find(|part| part.kind == PartKind::ToolResult).unwrap();
     assert_eq!((result.tool_name.as_deref(), result.is_error, result.role), (Some("lookup"), true, "tool"));
     let emitted: Vec<_> = call.tool_calls().map(|part| part.tool_call_id.clone().unwrap()).collect();
     assert_eq!(emitted, ["c2"]);
-    assert_eq!(call.user_messages(), 1);
+    assert!(!call.starts_turn(), "ends with a tool result: continues a turn");
     // The empty assistant text is not stored.
     assert!(!call.parts.iter().any(|part| part.side == Side::Response && part.kind == PartKind::Text));
 }
@@ -211,9 +213,10 @@ fn anthropic_stream_through_langdock_is_priced() {
     // 10 uncached x 3 + 1000 cached x 0.3 + 100 written x 3.75 + 30 out x 15, per million.
     let expected = (10.0 * 3.0 + 1000.0 * 0.3 + 100.0 * 3.75 + 30.0 * 15.0) / 1e6;
     assert!((call.cost_usd.unwrap() - expected).abs() < 1e-12);
+    assert!((call.output_cost_usd.unwrap() - 30.0 * 15.0 / 1e6).abs() < 1e-12);
     let result = call.parts.iter().find(|part| part.kind == PartKind::ToolResult).unwrap();
     assert_eq!((result.tool_name.as_deref(), result.role, result.is_error), (Some("lookup"), "tool", false));
-    assert_eq!(call.user_messages(), 1, "a tool result is not a new user turn");
+    assert!(!call.starts_turn(), "a tool result is not a new user turn");
     let emitted: Vec<_> =
         call.tool_calls().map(|part| (part.tool_call_id.clone().unwrap(), part.content.text.clone())).collect();
     assert_eq!(emitted, [("tu2".to_owned(), "{\"q\":2}".to_owned())]);
@@ -320,4 +323,5 @@ fn identical_texts_share_a_hash() {
     let request = json!({ "model": "m", "messages": [{ "role": "system", "content": "same" }, { "role": "user", "content": "same" }] });
     let call = process(&exchange("http", OPENROUTER, Some(200), request, &[], done(1)));
     assert_eq!(call.parts[0].content.hash, call.parts[1].content.hash);
+    assert!(call.starts_turn());
 }

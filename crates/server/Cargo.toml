@@ -7,9 +7,11 @@ version.workspace = true
 
 [dependencies]
 traumfaenger-api.workspace = true
+traumfaenger-process.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 chrono.workspace = true
 duckdb = { version = "1", features = ["bundled"] }
+flate2 = "1"
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 rmp-serde = "1"
@@ -18,9 +20,9 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tower-http = { version = "0.6", features = ["decompression-gzip", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zstd = "0.13"
 
 [dev-dependencies]
-flate2 = "1"
 http-body-util = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio = { version = "1", features = ["io-util"] }

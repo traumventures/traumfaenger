@@ -5,8 +5,9 @@ use std::fmt::Write;
 use ts_rs::{Config, TS};
 
 use crate::{
-    ApiError, ClientMessage, Dimension, Direction, EndReason, ErrorCode, Exchange, ExchangeEnd, Frame, HealthResponse,
-    IngestRequest, IngestResult, ListQuery, ListResponse, LogEntry, RejectedExchange, ServerMessage, StoredExchange,
+    AnalyticsResponse, ApiError, CallDetail, CallPart, ClientMessage, ContentResponse, Dimension, Direction, EndReason,
+    ErrorCode, Exchange, ExchangeEnd, Frame, HealthResponse, IngestRequest, IngestResult, ListQuery, ListResponse,
+    LogEntry, ParseCoverage, ProcessingStatus, RejectedExchange, ServerMessage, SessionResponse, StoredExchange,
     SummaryQuery, SummaryResponse, SummaryRow, Transport, limits, protocols, routes,
 };
 
@@ -38,6 +39,13 @@ pub fn typescript_bindings() -> String {
         SummaryQuery::decl(&cfg),
         SummaryRow::decl(&cfg),
         SummaryResponse::decl(&cfg),
+        AnalyticsResponse::decl(&cfg),
+        CallPart::decl(&cfg),
+        CallDetail::decl(&cfg),
+        SessionResponse::decl(&cfg),
+        ContentResponse::decl(&cfg),
+        ParseCoverage::decl(&cfg),
+        ProcessingStatus::decl(&cfg),
         HealthResponse::decl(&cfg),
         ErrorCode::decl(&cfg),
         ApiError::decl(&cfg),
@@ -56,6 +64,11 @@ pub fn typescript_bindings() -> String {
         ("listExchanges", routes::LIST_EXCHANGES),
         ("getExchange", routes::GET_EXCHANGE),
         ("summary", routes::SUMMARY),
+        ("analytics", routes::ANALYTICS),
+        ("call", routes::CALL),
+        ("session", routes::SESSION),
+        ("content", routes::CONTENT),
+        ("processing", routes::PROCESSING),
     ];
     write_constants(&mut out, "ROUTES", route_entries.iter().map(|(name, path)| (*name, format!("\"{path}\""))));
     write_constants(

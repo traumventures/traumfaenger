@@ -39,8 +39,9 @@ pub fn find(model: &str) -> Option<&'static Price> {
     PRICES.iter().find(|price| normalized.starts_with(price.model))
 }
 
-/// Cost of a call from its usage, or `None` without a price or token counts.
-pub fn price(model: &str, usage: &Usage) -> Option<f64> {
+/// Input and output cost of a call from its usage, or `None` without a price
+/// or token counts.
+pub fn split(model: &str, usage: &Usage) -> Option<(f64, f64)> {
     let price = find(model)?;
     let input = usage.input?;
     let output = usage.output.unwrap_or(0);
@@ -48,10 +49,13 @@ pub fn price(model: &str, usage: &Usage) -> Option<f64> {
     let written = usage.cache_write.unwrap_or(0);
     let uncached = input.saturating_sub(cached + written);
     let per_token = |tokens: u64, rate: f64| tokens as f64 * rate / 1_000_000.0;
-    Some(
-        per_token(uncached, price.input)
-            + per_token(cached, price.cached)
-            + per_token(written, price.cache_write)
-            + per_token(output, price.output),
-    )
+    Some((
+        per_token(uncached, price.input) + per_token(cached, price.cached) + per_token(written, price.cache_write),
+        per_token(output, price.output),
+    ))
+}
+
+/// Total cost of a call from its usage; see [`split`].
+pub fn price(model: &str, usage: &Usage) -> Option<f64> {
+    split(model, usage).map(|(input, output)| input + output)
 }

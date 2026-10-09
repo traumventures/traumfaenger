@@ -1,6 +1,6 @@
 # traumfaenger
 
-Records the traffic between your services and AI providers: every HTTP call, SSE stream and WebSocket session, exactly as it went over the wire and timestamped per frame. Cost, tokens, latency, messages and tool calls can later be derived from it and traced back to the single operation that caused them.
+Records the traffic between your services and AI providers: every HTTP call, SSE stream and WebSocket session, exactly as it went over the wire and timestamped per frame. The server then processes the raw log into calls with model, provider, outcome, tokens, cost and timings, plus message parts and tool calls, and serves analytics over them, split by model, workload, provider, tool, session or any metadata key.
 
 - **Recording:** clients record exchanges and stream them to the database in the background.
   - **TypeScript** (`@traumfaenger/client`): `database.fetch()` wraps `fetch` and works as the `fetch` option of any Vercel AI SDK provider; `database.socket()` wraps provider WebSockets, for example realtime voice APIs.
@@ -8,7 +8,7 @@ Records the traffic between your services and AI providers: every HTTP call, SSE
   - **rig** (`traumfaenger-rig`): `Recorded` wraps the HTTP and WebSocket client of any rig provider.
 - **Rust server:** one binary, with DuckDB as embedded storage and no UI. It runs two separate APIs, each on its own port with its own bearer token:
   - **ingestion** (write-only, `:7600`): a WebSocket at `GET /v1/ingest` that speaks JSON or MessagePack, negotiated as a subprotocol, plus `POST /v1/exchanges` for one JSON batch.
-  - **query** (read-only, `:7601`): `GET /v1/exchanges`, `GET /v1/exchanges/{id}`, `GET /v1/summary`.
+  - **query** (read-only, `:7601`): analytics (`GET /v1/analytics/{calls|tools|parts}`), call and session details, stored texts, processing status, and the raw log.
 - **End-to-end types:** the wire contract is defined once in Rust (`crates/api`). [ts-rs](https://github.com/Aleph-Alpha/ts-rs) generates `@traumfaenger/api` from it; `@traumfaenger/client` builds on that.
 
 Nothing here is specific to one project. Each traumfaenger server is one **database**; run one per environment (production, dev, …) instead of tagging records with an environment.
@@ -18,18 +18,37 @@ Nothing here is specific to one project. Each traumfaenger server is one **datab
 ```
 clients ──WS /v1/ingest──▶ raw log: raw_exchanges + raw_frames (append-only, ordered by seq)
                                  │
-                                 ▼  projections (not built yet)
-        calls · messages · tool calls · usage & cost · metrics per hour/day · archive
+                                 ▼  processing (traumfaenger-process), batches of 500 in seq order
+        calls · call_parts · call_metadata · tool_calls · contents (each distinct text once)
                                  │
                                  ▼
-                           query API / dashboards
+             query API: /v1/analytics/{calls,tools,parts} · /v1/sessions · /v1/calls → Grafana
 ```
 
-- **Write side (this version):** ingestion validates each record's envelope and appends it unparsed. It never interprets provider formats, so a parser bug can't lose data.
-- **Read side (later):** each projection reads the log in `seq` order and keeps its own tables. Its progress is stored in `projection_checkpoints`, and rebuilding means resetting the checkpoint. Archiving old raw data also belongs to this later step.
-- **Today:** `GET /v1/summary` reports collection statistics directly from the log: exchanges, failures, records, frames, bytes and durations.
+- **Write side:** ingestion validates each record's envelope and appends it unparsed. It never interprets provider formats, so a parser bug can't lose data.
+- **Read side:** processing reads final records in `seq` order and writes each batch with its checkpoint in one transaction (`projection_checkpoints`, `calls@<parser version>`).
+  - A new parser version starts over from the beginning of the raw log and replaces the rows of every exchange it reprocesses. The processed rows of exchanges whose raw records are gone stay.
+  - Raw retention (`TRAUMFAENGER_RETENTION_DAYS`) deletes only what has been processed.
 
-## The canonical record
+### Processing
+
+`traumfaenger-process` turns one exchange into one call and never fails: unknown formats are kept as `unparsed`, with whatever could still be read (status, timing, outcome).
+
+| | |
+|---|---|
+| APIs | OpenAI-style chat completions (OpenRouter, OpenAI, Langdock), Anthropic messages, Gemini `generateContent`, transcriptions, embeddings; plain or SSE |
+| Call | gateway (`openrouter`, `langdock`, …), upstream provider, requested and served model, outcome (`ok`, `rate_limited`, `client_error`, `provider_error`, `network_error`, `cancelled`, `incomplete`), finish reason, error |
+| Usage | input (including cached reads and cache writes), cached, cache write, output (including reasoning), reasoning |
+| Cost | `reported` when the gateway says what it charged (OpenRouter `usage.cost`), else `priced` from `crates/process/src/pricing.rs`, else `unknown`; split into input and output cost |
+| Timing | latency; time to first output, from the first event that carries text, reasoning or a tool call (keep-alives and empty deltas do not count) |
+| Parts | every message part (`text`, `reasoning`, `tool_call`, `tool_result`, `tool_definitions`, `image`, …) with role and side; tool results are named after the call they answer and flagged on error |
+| Turns | a call whose request ends with a user message starts a turn; calls ending with tool results continue it |
+
+**Storage.** Every distinct text (system prompt, message, tool definitions, arguments, result) is stored once in `contents`, keyed by the first 16 bytes of its BLAKE3 hash and zstd-compressed when that saves space; parts only point to it. On the first production export (5,607 calls), 58.5 MB of message text referenced 7.0 MB of distinct text, stored in 3.8 MB. Nothing counts references while writing, so a system prompt in thousands of calls is never a write hotspot; contents no part points to are swept after reprocessing.
+
+**Tool calls.** Each tool call the model makes is linked to the first later request of the same operation and session that carries its result: whether it errored, its size, and the gap between the call that requested it and the one that carried the result.
+
+## The canonical record## The canonical record
 
 HTTP, SSE and WebSocket share one shape: an exchange is an ordered list of timestamped frames, plus the context that isn't on the wire.
 
@@ -177,7 +196,45 @@ Connect to `GET /v1/ingest` with `Authorization: Bearer <ingest token>` and offe
 
 ## Query API
 
-All responses are JSON. Errors are `{ "error": ErrorCode, "message": string }` with status 400, 401, 404, 405, 413 or 500.
+All responses are JSON and need `Authorization: Bearer $TRAUMFAENGER_QUERY_TOKEN`. Errors are `{ "error": ErrorCode, "message": string }` with status 400, 401, 404, 405, 413 or 500.
+
+### Analytics
+
+`GET /v1/analytics/{source}` returns `{ source, rows, truncated }`: one flat object per group and time bucket. Metrics and dimensions are a fixed vocabulary (the error message of an unknown name lists the known ones); values are only ever bound as SQL parameters.
+
+| Parameter | |
+|---|---|
+| `metrics` | required, comma-separated |
+| `group_by` | comma-separated dimensions; `metadata.<key>` groups by a metadata value |
+| `interval` | bucket width such as `30s`, `5m`, `1h`, `1d`; adds a `time` column (RFC 3339). Grafana's `$__interval` works as is |
+| `from`, `to` | RFC 3339 or epoch milliseconds (Grafana's `${__from}`, `${__to}`), on the call start |
+| `order` | a requested metric, sorted descending (default: `time`, else the first metric) |
+| `limit` | 1–10000, default 1000 |
+| any dimension | a filter: `model=a,b`, `metadata.user=42` |
+
+| Source | Dimensions | Metrics |
+|---|---|---|
+| `calls` | `call_id`, `service`, `operation`, `session_id`, `gateway`, `provider`, `model`, `model_requested`, `api`, `outcome`, `finish_reason`, `transport`, `stream`, `turn_start`, `status`, `cost_source`, `parse_status`, `parse_reason`, `metadata.<key>` | `calls`, `failed_calls`, `error_rate`, `rate_limited_calls`, `sessions`, `turns`, `agent_turns`, `input_tokens`, `cached_tokens`, `cache_write_tokens`, `uncached_input_tokens`, `output_tokens`, `reasoning_tokens`, `total_tokens`, `cache_hit_rate`, `cost_usd`, `input_cost_usd`, `output_cost_usd`, `avg_cost_usd`, `unpriced_calls`, `latency_ms_{avg,p50,p95,p99,max}`, `ttft_ms_{avg,p50,p95,p99}`, `output_tokens_per_second`, `tool_calls`, `request_bytes`, `response_bytes`, `first_call`, `last_call` |
+| `tools` | `tool`, `call_id`, `service`, `operation`, `session_id`, `model`, `provider`, `result` (`ok`, `error`, `unanswered`) | `tool_calls`, `answered`, `failed`, `error_rate`, `gap_ms_{p50,p95,max}`, `arguments_bytes`, `result_bytes`, `sessions` |
+| `parts` | `side`, `role`, `kind`, `tool`, `call_id`, `service`, `operation`, `session_id`, `gateway`, `provider`, `model`, `outcome`, `metadata.<key>` | `parts`, `bytes`, `distinct_contents`, `allocated_cost_usd`, `allocated_tokens`, `calls` |
+
+`allocated_cost_usd` spreads each call's input cost over its request parts by size, and its output cost over its response parts. It answers what system prompts, tool definitions, history and each tool's results cost. It is an estimate: providers bill per call.
+
+```sh
+curl -H "Authorization: Bearer $T" 'http://traumfaenger:7601/v1/analytics/calls?metrics=cost_usd,calls,cache_hit_rate&group_by=model,provider'
+curl -H "Authorization: Bearer $T" 'http://traumfaenger:7601/v1/analytics/calls?metrics=input_tokens,cached_tokens,output_tokens&interval=1h&operation=listing-parse'
+curl -H "Authorization: Bearer $T" 'http://traumfaenger:7601/v1/analytics/parts?metrics=allocated_cost_usd&group_by=kind,tool&side=request'
+```
+
+**Grafana:** add an Infinity data source with the query URL and *Bearer token* auth, then in each panel use type JSON, the URL `/v1/analytics/calls?metrics=…&interval=$__interval&from=${__from}&to=${__to}`, and root selector `rows`.
+
+### Details
+
+- **`GET /v1/calls/{id}`**: one processed call with every message part. Texts are clipped to `max_chars` (default 2000); the full text is at `GET /v1/contents/{hash}`.
+- **`GET /v1/sessions/{id}`**: a session's calls in order. By default each call lists only the parts it added to the conversation, which reads as the trajectory; `new_only=false` lists all.
+- **`GET /v1/processing`**: parser version, processed and latest `seq`, stored contents and their size, and parse coverage per API, status and reason.
+
+### Raw log
 
 - **`GET /v1/exchanges`** returns raw log rows, one per record or segment, without frames, most recently stored first.
   - Filters: `service`, `operation`, `session_id`, `transport`, `failed`, and `from` and `to` (on `started_at`).
@@ -206,7 +263,7 @@ Docker: `docker build -t traumfaenger .`. The image stores data in the `/data` v
 | `TRAUMFAENGER_INGEST_TOKEN` | required | Bearer token of the ingestion API, at least 16 characters |
 | `TRAUMFAENGER_QUERY_TOKEN` | required | Bearer token of the query API; must differ from the ingestion token |
 | `TRAUMFAENGER_AUTH` | `required` | Set `disabled` to run without tokens, for local development only |
-| `TRAUMFAENGER_RETENTION_DAYS` | unset (keep) | Delete raw records this many days after receipt, but only once every projection has processed them. While no projection exists, nothing is deleted |
+| `TRAUMFAENGER_RETENTION_DAYS` | unset (keep) | Delete raw records this many days after receipt, but only once they are processed. Processed calls and contents stay |
 | `TRAUMFAENGER_MEMORY_LIMIT` | DuckDB default | DuckDB `memory_limit`, e.g. `512MB` |
 | `RUST_LOG` | `info` | Log filter |
 
@@ -221,6 +278,22 @@ Docker: `docker build -t traumfaenger .`. The image stores data in the `/data` v
 1. Edit `crates/api/src/lib.rs`.
 2. Run `bun run gen` to rewrite `packages/api/src/generated.ts`. `cargo test` fails while the two differ.
 3. Schema changes are appended to `MIGRATIONS` in `crates/server/src/store.rs`; never edit a released entry.
+
+## Working on processing
+
+Export a database, then iterate on the parser against it:
+
+```sh
+# Export: every exchange as JSON Lines (keep it out of any repository; it holds real prompts).
+#   for id in GET /v1/exchanges?limit=1000 (follow next_cursor): GET /v1/exchanges/{id}
+cargo run --release -p traumfaenger-process --bin traumfaenger-replay -- export.jsonl.gz --show outcome
+cargo run --release -p traumfaenger-server -- import export.jsonl.gz local.duckdb   # raw log + processing
+TRAUMFAENGER_DATABASE=local.duckdb TRAUMFAENGER_AUTH=disabled cargo run --release -p traumfaenger-server
+```
+
+The replay report shows parse coverage by API, status and reason, how often each field is filled, contents and their deduplication, tool call linking, and cost per operation. `import` loads and processes 5,607 calls in a few seconds.
+
+Changing what processing produces means bumping `PARSER_VERSION` in `crates/process/src/lib.rs`; the server then reprocesses the raw log on start.
 
 ## Develop
 

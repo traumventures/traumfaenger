@@ -569,6 +569,29 @@ test("summarises collected exchanges", async () => {
     expect(await query.getExchange("does/not exist")).toBeNull();
 });
 
+test("processes recorded exchanges and serves analytics", async () => {
+    let status = await query.processing();
+    for (let tries = 0; status.processed_seq < status.latest_seq && tries < 50; tries++) {
+        await Bun.sleep(200);
+        status = await query.processing();
+    }
+    expect(status.processed_seq).toBe(status.latest_seq);
+    expect(status.calls).toBeGreaterThan(0);
+    const byTransport = await query.analytics("calls", {
+        metrics: ["calls", "output_tokens"],
+        groupBy: ["transport"],
+        filters: { service: "test-service", transport: ["sse"] },
+    });
+    expect(byTransport.rows.length).toBe(1);
+    expect(byTransport.rows[0]?.transport).toBe("sse");
+    expect(Number(byTransport.rows[0]?.calls)).toBeGreaterThan(0);
+    const hourly = await query.analytics("calls", { metrics: ["calls"], interval: "1h", from: new Date(0) });
+    expect(typeof hourly.rows[0]?.time).toBe("string");
+    await expect(query.analytics("calls", { metrics: ["nope"] })).rejects.toMatchObject({ code: "invalid_request" });
+    expect(await query.call("does/not exist")).toBeNull();
+    expect(await query.session("no-such-session")).toBeNull();
+});
+
 test("splits SSE text into events across chunk boundaries", () => {
     expect(splitEvents("event: a\ndata: 1\n\ndata: 2\r\n\r\n\n\n: ping\n\n")).toEqual(["event: a\ndata: 1", "data: 2", ": ping"]);
     const splitter = new SseSplitter();

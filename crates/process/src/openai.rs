@@ -163,6 +163,15 @@ fn read_usage(usage: &Value, parsed: &mut Parsed) {
             None
         };
         parsed.cost_usd = Some(cost + upstream.unwrap_or(0.0));
+        let details = usage.get("cost_details");
+        let prompt = details.and_then(|details| details.get("upstream_inference_prompt_cost")).and_then(Value::as_f64);
+        let completion =
+            details.and_then(|details| details.get("upstream_inference_completions_cost")).and_then(Value::as_f64);
+        if let (Some(prompt), Some(completion)) = (prompt, completion)
+            && prompt + completion > 0.0
+        {
+            parsed.input_share = Some(prompt / (prompt + completion));
+        }
     }
 }
 

@@ -6,7 +6,7 @@ use std::{
 
 use tokio::{net::TcpListener, sync::watch};
 use tracing_subscriber::EnvFilter;
-use traumfaenger_server::{config::Config, http, store::Store};
+use traumfaenger_server::{config::Config, http, projection, store::Store};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `traumfaenger-server healthcheck`: for container health checks in images
@@ -21,7 +21,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    // `traumfaenger-server import <export.jsonl[.gz]> <database>`: loads an
+    // export of `GET /v1/exchanges/{id}` responses into a database and
+    // processes it, for working on processing and analytics locally.
+    if std::env::args().nth(1).as_deref() == Some("import") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let [export, database] = args.as_slice() else {
+            eprintln!("usage: traumfaenger-server import <export.jsonl[.gz]> <database>");
+            std::process::exit(2);
+        };
+        return import(export, database);
+    }
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(serve())
+}
+
+fn import(export: &str, database: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, BufReader, Read};
+    use traumfaenger_api::{Exchange, StoredExchange};
+
+    let started = std::time::Instant::now();
+    let store = Store::open(database, None)?;
+    let file = std::fs::File::open(export)?;
+    let reader: Box<dyn Read> =
+        if export.ends_with(".gz") { Box::new(flate2::read::MultiGzDecoder::new(file)) } else { Box::new(file) };
+    let (mut batch, mut accepted, mut duplicates) = (Vec::new(), 0, 0);
+    let mut flush = |batch: &mut Vec<Exchange>| -> Result<(), Box<dyn std::error::Error>> {
+        let inserted = store.insert(batch, chrono::Utc::now())?;
+        accepted += inserted.accepted;
+        duplicates += inserted.duplicates;
+        batch.clear();
+        Ok(())
+    };
+    for line in BufReader::new(reader).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let stored: StoredExchange = serde_json::from_str(&line)?;
+        batch.push(Exchange {
+            id: stored.id,
+            segment: 0,
+            is_final: true,
+            service: stored.service,
+            operation: stored.operation,
+            session_id: stored.session_id,
+            metadata: Some(stored.metadata).filter(|metadata| !metadata.is_empty()),
+            transport: stored.transport,
+            url: stored.url,
+            started_at: stored.started_at,
+            status: stored.status,
+            frames: stored.frames,
+            end: stored.end,
+            truncated: stored.truncated,
+        });
+        if batch.len() == traumfaenger_api::limits::MAX_BATCH_SIZE {
+            flush(&mut batch)?;
+        }
+    }
+    flush(&mut batch)?;
+    let loaded = started.elapsed();
+    store.prepare_processing()?;
+    let mut processed = 0;
+    loop {
+        let progress = store.process_batch(projection::BATCH)?;
+        processed += progress.processed;
+        if progress.caught_up {
+            break;
+        }
+    }
+    store.sweep_contents()?;
+    store.checkpoint()?;
+    println!(
+        "imported {accepted} exchanges ({duplicates} already there) in {:.1}s, processed {processed} in {:.1}s",
+        loaded.as_secs_f64(),
+        (started.elapsed() - loaded).as_secs_f64()
+    );
+    Ok(())
 }
 
 /// One plain HTTP/1.0 request to `/health`; the answer must be a 200.
@@ -67,6 +142,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         "traumfaenger listening"
     );
 
+    tokio::spawn(run_processing(store.clone()));
     if let Some(days) = config.retention_days {
         tokio::spawn(enforce_retention(store.clone(), days));
     }
@@ -100,6 +176,54 @@ async fn enforce_retention(store: Arc<Store>, days: u32) {
             Ok(Ok(deleted)) => tracing::info!(deleted, days, "deleted raw calls past retention"),
             Ok(Err(error)) => tracing::error!(%error, "retention cleanup failed"),
             Err(error) => tracing::error!(%error, "retention task panicked"),
+        }
+    }
+}
+
+/// Processes new raw records into calls, continuously.
+async fn run_processing(store: Arc<Store>) {
+    let prepare = store.clone();
+    let mut sweep_when_caught_up = match tokio::task::spawn_blocking(move || prepare.prepare_processing()).await {
+        Ok(Ok(restarted)) => {
+            if restarted {
+                tracing::info!("parser version changed, reprocessing the raw log");
+            }
+            restarted
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, "cannot start processing");
+            return;
+        }
+        Err(error) => {
+            tracing::error!(%error, "processing task panicked");
+            return;
+        }
+    };
+    loop {
+        let worker = store.clone();
+        match tokio::task::spawn_blocking(move || worker.process_batch(projection::BATCH)).await {
+            Ok(Ok(progress)) => {
+                if progress.caught_up {
+                    if sweep_when_caught_up {
+                        sweep_when_caught_up = false;
+                        let sweeper = store.clone();
+                        match tokio::task::spawn_blocking(move || sweeper.sweep_contents()).await {
+                            Ok(Ok(removed)) => tracing::info!(removed, "reprocessing done, removed unused contents"),
+                            Ok(Err(error)) => tracing::error!(%error, "content sweep failed"),
+                            Err(error) => tracing::error!(%error, "content sweep panicked"),
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "processing failed, retrying");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "processing task panicked, retrying");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
         }
     }
 }
