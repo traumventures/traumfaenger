@@ -23,9 +23,16 @@ export function clipBytes(text: string, maxBytes: number): Clipped {
     return { text: new TextDecoder().decode(bytes.subarray(0, end)), truncated: true };
 }
 
-/** Replaces lone UTF-16 surrogates, which strict UTF-8 and JSON decoders reject. */
+/** A UTF-16 surrogate without its partner. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
+ * Replaces lone UTF-16 surrogates, which strict UTF-8 and JSON decoders
+ * reject. Same as `String.prototype.toWellFormed`, which hosts compiling
+ * against an ES2023 lib cannot name.
+ */
 export function wellFormed(text: string): string {
-    return text.toWellFormed();
+    return text.replace(LONE_SURROGATE, "\uFFFD");
 }
 
 /** Inline base64 data of at least 1 KiB, as in `data:image/png;base64,...`. */
