@@ -18,4 +18,6 @@ ENV TRAUMFAENGER_DATABASE=/data/traumfaenger.duckdb \
     TRAUMFAENGER_QUERY_ADDR=0.0.0.0:7601
 VOLUME /data
 EXPOSE 7600 7601
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/traumfaenger-server", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/traumfaenger-server"]

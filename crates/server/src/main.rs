@@ -1,11 +1,53 @@
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::{net::TcpListener, sync::watch};
 use tracing_subscriber::EnvFilter;
 use traumfaenger_server::{config::Config, http, store::Store};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `traumfaenger-server healthcheck`: for container health checks in images
+    // without curl. Asks `/health` on both listeners of the running server.
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        let config = Config::from_env()?;
+        for addr in [config.ingest_addr, config.query_addr] {
+            if let Err(error) = healthcheck(addr) {
+                eprintln!("unhealthy: {addr}: {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(serve())
+}
+
+/// One plain HTTP/1.0 request to `/health`; the answer must be a 200.
+fn healthcheck(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    let target = if addr.ip().is_unspecified() {
+        let loopback: IpAddr = if addr.is_ipv4() { Ipv4Addr::LOCALHOST.into() } else { Ipv6Addr::LOCALHOST.into() };
+        SocketAddr::new(loopback, addr.port())
+    } else {
+        addr
+    };
+    let timeout = Duration::from_secs(3);
+    let mut stream = std::net::TcpStream::connect_timeout(&target, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+    let mut head = [0u8; 12];
+    stream.read_exact(&mut head)?;
+    if &head[9..12] == b"200" {
+        Ok(())
+    } else {
+        Err(format!("status {}", String::from_utf8_lossy(&head[9..12])).into())
+    }
+}
+
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
