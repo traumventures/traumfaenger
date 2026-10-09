@@ -367,9 +367,80 @@ fn retention_keeps_open_exchanges_until_they_are_processed() {
     store.insert(&[ws_record("open", 1, true)], Utc::now()).unwrap();
     while !store.process_batch(projection::BATCH).unwrap().caught_up {}
     assert_eq!(call_ids(&store), ["c1", "open"]);
-    assert_eq!(store.delete_received_before(cutoff).unwrap(), 1, "processed now");
+    // Processed, but its final record is not past the cutoff yet: deleting
+    // the old segment would leave a reprocessing with half the exchange.
+    assert_eq!(store.delete_received_before(cutoff).unwrap(), 0);
+    assert_eq!(store.delete_received_before(Utc::now() + chrono::Duration::seconds(1)).unwrap(), 2);
     // A record that never finishes goes a week after the cutoff.
     store.insert(&[ws_record("abandoned", 0, false)], Utc::now() - chrono::Duration::days(9)).unwrap();
     while !store.process_batch(projection::BATCH).unwrap().caught_up {}
     assert_eq!(store.delete_received_before(cutoff).unwrap(), 1);
+}
+
+#[test]
+fn a_reused_tool_call_id_is_not_linked_to_another_conversations_result() {
+    // Like above, but conversation A's result is processed in an earlier
+    // window than B's: B must not fall back to A's result.
+    let call = |args: &str| json!({ "role": "assistant", "content": null, "tool_calls": [{ "id": "functions.lookup:0", "type": "function", "function": { "name": "lookup", "arguments": args } }] });
+    let result = |text: &str| json!({ "role": "tool", "tool_call_id": "functions.lookup:0", "content": text });
+    let user = |text: &str| json!({ "role": "user", "content": text });
+    let answer_with = |args: &str| {
+        let mut value = answer(None, Some(("functions.lookup:0", "lookup")), 0.001);
+        value["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = json!(args);
+        value
+    };
+    let no_session = json!({ "session_id": null });
+    let store = Store::open(":memory:", None).unwrap();
+    store.prepare_processing().unwrap();
+    store
+        .insert(
+            &[
+                exchange(
+                    "a1",
+                    "2026-10-09T10:00:00Z",
+                    json!([user("a")]),
+                    answer_with("{\"q\":\"a\"}"),
+                    no_session.clone(),
+                ),
+                exchange(
+                    "b1",
+                    "2026-10-09T10:00:01Z",
+                    json!([user("b")]),
+                    answer_with("{\"q\":\"b\"}"),
+                    no_session.clone(),
+                ),
+                exchange(
+                    "a2",
+                    "2026-10-09T10:00:02Z",
+                    json!([user("a"), call("{\"q\":\"a\"}"), result("ra")]),
+                    answer(Some("done a"), None, 0.001),
+                    no_session.clone(),
+                ),
+            ],
+            Utc::now(),
+        )
+        .unwrap();
+    while !store.process_batch(projection::BATCH).unwrap().caught_up {}
+    store
+        .insert(
+            &[exchange(
+                "b2",
+                "2026-10-09T10:00:03Z",
+                json!([user("b"), call("{\"q\":\"b\"}"), result("rb")]),
+                answer(Some("done b"), None, 0.001),
+                no_session,
+            )],
+            Utc::now(),
+        )
+        .unwrap();
+    while !store.process_batch(projection::BATCH).unwrap().caught_up {}
+    let mut rows = analytics(&store, "tools", "metrics=tool_calls&group_by=call_id,result_call_id");
+    rows.sort_by_key(|row| row["call_id"].as_str().unwrap().to_owned());
+    assert_eq!(
+        rows,
+        [
+            json!({ "call_id": "a1", "result_call_id": "a2", "tool_calls": 1 }),
+            json!({ "call_id": "b1", "result_call_id": "b2", "tool_calls": 1 }),
+        ]
+    );
 }

@@ -49,6 +49,16 @@ impl Content {
     }
 }
 
+/// Identifies tool call arguments regardless of formatting: the hash of
+/// their canonical JSON (apps re-serialize the arguments they resend), or of
+/// the text itself when it is not JSON.
+pub fn arguments_key(text: &str) -> ContentHash {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) => Content::json(&value).hash,
+        Err(_) => Content::new(text.to_owned()).hash,
+    }
+}
+
 /// Which provider API the exchange spoke.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Api {

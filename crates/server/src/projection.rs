@@ -20,7 +20,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use chrono::{DateTime, Duration, Utc};
 use duckdb::{appender_params_from_iter, types::Value};
 use traumfaenger_api::StoredExchange;
-use traumfaenger_process::{Call, PARSER_VERSION, Parse, PartKind, Side, process};
+use traumfaenger_process::{Call, PARSER_VERSION, Parse, PartKind, Side, arguments_key, process};
 
 use crate::store::{Store, StoreError, count, optional_text, text, timestamp};
 
@@ -121,9 +121,9 @@ impl Store {
         let processed: Vec<(i64, StoredExchange, Call)> = window
             .exchanges
             .into_iter()
-            .map(|(seq, exchange)| {
-                let call = process_guarded(&exchange);
-                (seq, exchange, call)
+            .filter_map(|(seq, exchange)| {
+                let call = process_guarded(&exchange)?;
+                Some((seq, exchange, call))
             })
             .collect();
         self.write_batch(&processed, window.end)?;
@@ -164,7 +164,7 @@ impl Store {
              CREATE TEMP TABLE IF NOT EXISTS staging_contents AS SELECT * FROM contents LIMIT 0;
              CREATE TEMP TABLE IF NOT EXISTS staging_metadata AS SELECT * FROM call_metadata LIMIT 0;
              CREATE TEMP TABLE IF NOT EXISTS staging_results (call_id VARCHAR, started_at TIMESTAMP, \
-                 tool_call_id VARCHAR, operation VARCHAR, session_id VARCHAR, arguments HUGEINT, content HUGEINT, \
+                 tool_call_id VARCHAR, operation VARCHAR, session_id VARCHAR, arguments_key HUGEINT, content HUGEINT, \
                  bytes INTEGER, is_error BOOLEAN);
              DELETE FROM temp.staging_calls; DELETE FROM temp.staging_parts; DELETE FROM temp.staging_tool_calls;
              DELETE FROM temp.staging_contents; DELETE FROM temp.staging_results;
@@ -252,7 +252,7 @@ impl Store {
                     .parts
                     .iter()
                     .filter(|part| part.side == Side::Request && part.kind == PartKind::ToolCall)
-                    .filter_map(|part| Some((part.tool_call_id.as_deref()?, part.content.hash)))
+                    .filter_map(|part| Some((part.tool_call_id.as_deref()?, arguments_key(&part.content.text))))
                     .collect();
                 for part in &call.parts {
                     content(part.content.hash, &part.content.text)?;
@@ -293,6 +293,7 @@ impl Store {
                             Value::Null,
                             Value::Null,
                             Value::Null,
+                            Value::HugeInt(hash_value(arguments_key(&part.content.text))),
                         ]))?;
                     }
                     if part.kind == PartKind::ToolResult
@@ -360,12 +361,9 @@ impl Store {
         )?;
         // Each tool call is answered by the first later call that carries its
         // result (agents resend the conversation, so later ones repeat it).
-        // Ids are only unique per conversation (some providers number them
-        // `functions.name:0`), so every open tool call takes its own nearest
-        // result: first one whose request resent the call with the same
-        // arguments, then any. Calls without an id (Gemini) match by name.
-        for same_arguments in [true, false] {
-            transaction.execute_batch(&link_results_sql(same_arguments))?;
+        // Calls without an id (Gemini) match by tool name.
+        for pass in [Link::SameArguments, Link::UniqueId, Link::NotResent] {
+            transaction.execute_batch(&link_results_sql(pass))?;
         }
         transaction.execute(
             "UPDATE projection_checkpoints SET last_seq = ? WHERE projection = ?",
@@ -383,9 +381,30 @@ impl Store {
     }
 }
 
+/// How [`link_results_sql`] matches an open tool call to a result.
+///
+/// Ids are only unique per conversation for some providers (`functions.name:0`)
+/// and match keys are names for Gemini, so a key used by several tool calls
+/// needs more than the key. Apps resend arguments re-serialized and with
+/// schema defaults filled in, so differing arguments do not rule a result out
+/// for a key only one tool call uses.
+#[derive(Clone, Copy)]
+enum Link {
+    /// The result's request resent the call with the same canonical arguments.
+    SameArguments,
+    /// The key belongs to one tool call only: the nearest result.
+    UniqueId,
+    /// A shared key: only results whose request did not resend the call.
+    NotResent,
+}
+
 /// Links open tool calls to their nearest later result in `staging_results`.
-fn link_results_sql(same_arguments: bool) -> String {
-    let arguments = if same_arguments { " AND o.arguments = r.arguments" } else { "" };
+fn link_results_sql(pass: Link) -> String {
+    let (open, results, arguments) = match pass {
+        Link::SameArguments => ("", "", " AND o.arguments_key = r.arguments_key"),
+        Link::UniqueId => (" AND uses = 1", "", ""),
+        Link::NotResent => (" AND uses > 1", " WHERE arguments_key IS NULL", ""),
+    };
     format!(
         "UPDATE tool_calls t SET result_call_id = m.result_call_id, result = m.content, \
              result_bytes = m.bytes, is_error = m.is_error, gap_ms = m.gap_ms
@@ -393,17 +412,20 @@ fn link_results_sql(same_arguments: bool) -> String {
              SELECT o.call_id, o.match_key, r.call_id AS result_call_id, r.content, r.bytes, r.is_error,
                     date_diff('millisecond', o.ended_at, r.started_at) AS gap_ms
              FROM (
-                 SELECT call_id, coalesce(tool_call_id, tool_name) AS match_key, operation,
-                        coalesce(session_id, '') AS session_key, arguments, started_at, ended_at
-                 FROM tool_calls
-                 WHERE result_call_id IS NULL AND coalesce(tool_call_id, tool_name) IS NOT NULL
-                   AND started_at <= (SELECT max(started_at) FROM temp.staging_results)
-                   AND started_at >= (SELECT min(started_at) FROM temp.staging_results) - INTERVAL 1 DAY
+                 SELECT * FROM (
+                     SELECT call_id, result_call_id, coalesce(tool_call_id, tool_name) AS match_key, operation,
+                            coalesce(session_id, '') AS session_key, arguments_key, started_at, ended_at,
+                            count(*) OVER (PARTITION BY match_key, operation, session_key) AS uses
+                     FROM tool_calls
+                     WHERE coalesce(tool_call_id, tool_name) IS NOT NULL
+                       AND started_at <= (SELECT max(started_at) FROM temp.staging_results)
+                       AND started_at >= (SELECT min(started_at) FROM temp.staging_results) - INTERVAL 1 DAY
+                 ) WHERE result_call_id IS NULL{open}
              ) o
              ASOF JOIN (
                  SELECT call_id, tool_call_id AS match_key, operation, coalesce(session_id, '') AS session_key,
-                        arguments, started_at, content, bytes, is_error
-                 FROM temp.staging_results
+                        arguments_key, started_at, content, bytes, is_error
+                 FROM temp.staging_results{results}
              ) r
              ON o.match_key = r.match_key AND o.operation = r.operation AND o.session_key = r.session_key{arguments}
                 AND r.started_at > o.started_at
@@ -414,14 +436,20 @@ fn link_results_sql(same_arguments: bool) -> String {
 }
 
 /// [`process`], but a parser panic yields an `unparsed` call (read without
-/// its frames) instead of stopping all processing at this exchange.
-fn process_guarded(exchange: &StoredExchange) -> Call {
-    catch_unwind(AssertUnwindSafe(|| process(exchange))).unwrap_or_else(|_| {
-        tracing::error!(id = %exchange.id, "parser panicked, storing the call as unparsed");
-        let mut call = process(&StoredExchange { frames: Vec::new(), ..exchange.clone() });
-        call.parse = Parse::Unparsed("panic".into());
-        call
-    })
+/// its frames) instead of stopping all processing at this exchange. `None`
+/// (logged) if even that panics.
+fn process_guarded(exchange: &StoredExchange) -> Option<Call> {
+    if let Ok(call) = catch_unwind(AssertUnwindSafe(|| process(exchange))) {
+        return Some(call);
+    }
+    tracing::error!(id = %exchange.id, "parser panicked, storing the call as unparsed");
+    let bare = StoredExchange { frames: Vec::new(), ..exchange.clone() };
+    let Ok(mut call) = catch_unwind(AssertUnwindSafe(|| process(&bare))) else {
+        tracing::error!(id = %exchange.id, "parser panicked without frames too, skipping the call");
+        return None;
+    };
+    call.parse = Parse::Unparsed("panic".into());
+    Some(call)
 }
 
 fn call_row(

@@ -153,7 +153,9 @@ const MIGRATIONS: &[&str] = &[
         result HUGEINT,
         result_bytes INTEGER,
         is_error BOOLEAN,
-        gap_ms BIGINT
+        gap_ms BIGINT,
+        -- Formatting-independent hash of the arguments, to match resent calls.
+        arguments_key HUGEINT NOT NULL
     )",
 ];
 
@@ -479,13 +481,14 @@ impl Store {
     /// is not blocked for long. Returns how many records were deleted.
     pub fn delete_received_before(&self, cutoff: DateTime<Utc>) -> Result<usize, StoreError> {
         const CHUNK: i64 = 10_000;
-        // A record counts as processed once its exchange's final record is
-        // below every checkpoint: segments of an open WebSocket exchange fall
-        // below the checkpoint long before the exchange is processed. Records
-        // whose exchange never finished go after an extra week.
+        // Whole exchanges only: a record goes once its exchange's final record
+        // is processed by every projection and itself past the cutoff, so a
+        // later reprocessing still sees every segment. Segments of an open
+        // WebSocket exchange fall below the checkpoint long before that.
+        // Records whose exchange never finished go after an extra week.
         let eligible = "received_at < make_timestamp(?) \
              AND seq <= (SELECT coalesce(min(last_seq), 0) FROM projection_checkpoints) \
-             AND (id IN (SELECT id FROM raw_exchanges WHERE is_final \
+             AND (id IN (SELECT id FROM raw_exchanges WHERE is_final AND received_at < make_timestamp(?) \
                      AND seq <= (SELECT coalesce(min(last_seq), 0) FROM projection_checkpoints)) \
                   OR received_at < make_timestamp(?))";
         let cutoff_micros = cutoff.timestamp_micros();
@@ -496,7 +499,7 @@ impl Store {
             let transaction = connection.transaction()?;
             let upper: Option<i64> = transaction.query_row(
                 &format!("SELECT max(seq) FROM (SELECT seq FROM raw_exchanges WHERE {eligible} ORDER BY seq LIMIT ?)"),
-                duckdb::params![cutoff_micros, orphan_micros, CHUNK],
+                duckdb::params![cutoff_micros, cutoff_micros, orphan_micros, CHUNK],
                 |row| row.get(0),
             )?;
             let Some(upper) = upper else { return Ok(total) };
@@ -504,11 +507,11 @@ impl Store {
                 &format!(
                     "DELETE FROM raw_frames WHERE seq IN (SELECT seq FROM raw_exchanges WHERE {eligible} AND seq <= ?)"
                 ),
-                duckdb::params![cutoff_micros, orphan_micros, upper],
+                duckdb::params![cutoff_micros, cutoff_micros, orphan_micros, upper],
             )?;
             let deleted = transaction.execute(
                 &format!("DELETE FROM raw_exchanges WHERE {eligible} AND seq <= ?"),
-                duckdb::params![cutoff_micros, orphan_micros, upper],
+                duckdb::params![cutoff_micros, cutoff_micros, orphan_micros, upper],
             )?;
             transaction.commit()?;
             total += deleted;
