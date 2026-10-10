@@ -212,7 +212,7 @@ All responses are JSON and need `Authorization: Bearer $TRAUMFAENGER_QUERY_TOKEN
 | `from`, `to` | RFC 3339 or epoch milliseconds (Grafana's `${__from}`, `${__to}`), on the call start |
 | `order` | a requested metric, sorted descending (default: `time`, else the first metric) |
 | `limit` | 1–10000, default 1000 |
-| any dimension | a filter: `model=a,b`, `metadata.user=42` |
+| any dimension | a filter: `model=a,b`, `metadata.user=42`; `*` accepts every value (a dashboard variable set to "All") |
 
 | Source | Dimensions | Metrics |
 |---|---|---|

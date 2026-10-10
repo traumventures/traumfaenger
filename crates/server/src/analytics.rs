@@ -349,6 +349,10 @@ impl Store {
             if accepted.is_empty() {
                 return Err(invalid(format!("filter `{name}` has no value")));
             }
+            // `*` accepts every value: what a dashboard variable set to "All" sends.
+            if accepted.contains(&"*") {
+                continue;
+            }
             clauses.push(format!("{sql} IN ({})", vec!["?"; accepted.len()].join(", ")));
             values.extend(accepted.into_iter().map(text));
         }

@@ -153,6 +153,8 @@ fn analytics_groups_buckets_and_filters() {
 
     let by_user = analytics(&store, "calls", "metrics=cost_usd&group_by=metadata.user&metadata.user=u2");
     assert_eq!(by_user, [json!({ "metadata.user": "u2", "cost_usd": 0.001 })]);
+    let all = analytics(&store, "calls", "metrics=calls&operation=*&model=*");
+    assert_eq!(all, [json!({ "calls": 4 })], "`*` filters nothing");
 
     // Cost allocated to what the requests carried: system prompts, history, tool results.
     let kinds = analytics(&store, "parts", "metrics=allocated_cost_usd&group_by=kind&side=request");
