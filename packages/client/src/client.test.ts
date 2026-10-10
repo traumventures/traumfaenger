@@ -61,7 +61,11 @@ const provider = Bun.serve({
             slow?: boolean;
             many?: number;
             model?: string;
+            headers?: Record<string, string>;
         };
+        if (body.headers !== undefined) {
+            return Response.json({ ok: true }, { status: 429, headers: body.headers });
+        }
         if (body.many !== undefined) {
             const events = Array.from({ length: body.many }, (_, n) => `data: {"n":${n}}\n\n`).join("");
             return new Response(`${events}data: {"usage":{"prompt_tokens":9}}\n\ndata: [DONE]\n\n`, {
@@ -270,8 +274,49 @@ test("nested operations merge metadata; calls outside any operation are unattrib
 
     const inner = await only("inner.step");
     expect(inner.session_id).toBe("s-2");
-    expect(inner.metadata).toEqual({ a: "1", b: "2" });
+    expect(inner.metadata).toMatchObject({ a: "1", b: "2" });
     expect((await only(UNATTRIBUTED)).frames[0]?.data).toBe('{"x":1}');
+});
+
+test("records when the headers arrived, the provider's request ids and rate limits", async () => {
+    const headers = {
+        "x-generation-id": "gen-42",
+        "request-id": "req-7",
+        "x-ratelimit-remaining-requests": "0",
+        "retry-after": "3",
+        "x-unrelated": "dropped",
+    };
+    const response = await database.operation({ operation: "rate.limited", metadata: { user_id: "9" } }, () =>
+        recorded(providerUrl, { method: "POST", body: JSON.stringify({ headers }) })
+    );
+    expect(response.status).toBe(429);
+    expect(response.headers.get("x-unrelated")).toBe("dropped");
+    await response.text();
+    await settle();
+
+    const exchange = await only("rate.limited");
+    const { "response.headers_ms": headersMs, ...rest } = exchange.metadata;
+    expect(Number(headersMs)).toBeGreaterThanOrEqual(0);
+    expect(Number(headersMs)).toBeLessThanOrEqual(exchange.end?.at_ms ?? 0);
+    expect(rest).toEqual({
+        user_id: "9",
+        "response.header.x-generation-id": "gen-42",
+        "response.header.request-id": "req-7",
+        "response.header.x-ratelimit-remaining-requests": "0",
+        "response.header.retry-after": "3",
+    });
+});
+
+test("response metadata never pushes the caller's metadata past the limit", async () => {
+    const own = Object.fromEntries(Array.from({ length: LIMITS.maxMetadataEntries }, (_, n) => [`k${n}`, "v"]));
+    await database.operation({ operation: "full.metadata", metadata: own }, async () => {
+        await (await recorded(providerUrl, { method: "POST", body: JSON.stringify({ headers: { "request-id": "r" } }) })).text();
+    });
+    await settle();
+
+    const exchange = await only("full.metadata");
+    expect(exchange.metadata).toEqual(own);
+    expect(exchange.truncated).toBe(false);
 });
 
 test("works as the fetch of an AI SDK provider", async () => {

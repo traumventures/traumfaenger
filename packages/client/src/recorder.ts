@@ -311,6 +311,8 @@ async function recordFetch(
     if (pending === undefined) return responsePromise;
     const request = pending;
     const elapsed = () => Math.round(performance.now() - start);
+    // Gains the response's metadata once the headers are in.
+    let recordContext = context;
 
     const record = (transport: Transport, status: number | undefined, inFrames: InFrame[], end: ExchangeEnd, truncated = false) => {
         request
@@ -321,7 +323,7 @@ async function recordFetch(
                 frames.add(0, "out", body);
                 for (const frame of inFrames) frames.add(frame.t, "in", frame.data);
                 emit(
-                    exchangeOf(context, { transport, url: request.url, started_at: startedAt, status, frames, end, truncated })
+                    exchangeOf(recordContext, { transport, url: request.url, started_at: startedAt, status, frames, end, truncated })
                 );
             })
             .catch(() => {
@@ -336,6 +338,10 @@ async function recordFetch(
         safely(() => record("http", undefined, [], endOf(elapsed(), "error", error)));
         throw error;
     }
+
+    safely(() => {
+        recordContext = withResponseMetadata(context, response.headers, elapsed());
+    });
 
     try {
         const contentType = response.headers.get("content-type") ?? "";
@@ -361,6 +367,34 @@ async function recordFetch(
     } catch {
         return response;
     }
+}
+
+/** Headers that identify a provider request; recorded as `response.header.<name>`. */
+const ID_HEADERS = new Set(["request-id", "x-request-id", "x-generation-id", "x-provider-name", "cf-ray"]);
+/** Rate-limit headers (`x-ratelimit-*`, `ratelimit-*`, `anthropic-ratelimit-*`, `retry-after`). */
+const RATE_LIMIT_HEADER = /^(x-ratelimit-|ratelimit|anthropic-ratelimit-|retry-after)/;
+const METADATA_KEY = new RegExp(`^[A-Za-z0-9_.-]{1,${LIMITS.maxMetadataKeyLen}}$`);
+
+/**
+ * Adds what the response headers say about the call to the metadata: when
+ * they arrived (`response.headers_ms`, since the request went out), the
+ * provider's request ids and its rate-limit state. Never pushes the metadata
+ * past its limits; the caller's own entries come first.
+ */
+function withResponseMetadata(context: Context, headers: Headers, headersMs: number): Context {
+    const metadata: Record<string, string> = { ...context.metadata };
+    let room = LIMITS.maxMetadataEntries - Object.keys(metadata).length;
+    const add = (key: string, value: string) => {
+        if (room <= 0 || key in metadata || !METADATA_KEY.test(key)) return;
+        metadata[key] = clipBytes(value, LIMITS.maxMetadataValueLen).text;
+        room--;
+    };
+    add("response.headers_ms", String(headersMs));
+    headers.forEach((value, rawName) => {
+        const name = rawName.toLowerCase();
+        if (ID_HEADERS.has(name) || RATE_LIMIT_HEADER.test(name)) add(`response.header.${name}`, value);
+    });
+    return { ...context, metadata };
 }
 
 function isTextual(contentType: string): boolean {

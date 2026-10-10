@@ -121,6 +121,8 @@ const realtime = database.operation({ operation: "voice.interview", sessionId },
 
 **Context:** `database.operation` keeps the context in `AsyncLocalStorage`, so every exchange inside it is tagged, including every step of an agent loop. Nested operations override `operation` and merge `metadata`. Exchanges outside any operation are `unattributed`.
 
+**Response metadata:** an HTTP or SSE exchange also carries `response.headers_ms` (when the response headers arrived, in ms since the request went out) and the provider's request-id and rate-limit headers as `response.header.<name>` (`request-id`, `x-request-id`, `x-generation-id`, `x-provider-name`, `cf-ray`, `x-ratelimit-*`, `ratelimit*`, `anthropic-ratelimit-*`, `retry-after*`). They only fill the room the caller's own metadata leaves within the entry limit.
+
 **Recording never changes or delays the call:**
 - The request goes out first.
 - Non-streaming responses are read from a `clone()` in the background.
