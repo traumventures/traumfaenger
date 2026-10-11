@@ -5,7 +5,7 @@
     "workspaces": ["packages/api", "packages/client"],
     "scripts": {
         "gen": "cargo run -q -p traumfaenger-api --bin gen-ts",
-        "typecheck": "tsc -p packages/api && tsc -p packages/client",
+        "typecheck": "bun check -p packages/api && bun check -p packages/client",
         "test": "bun test packages"
     },
     "devDependencies": {
