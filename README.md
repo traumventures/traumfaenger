@@ -50,7 +50,7 @@ clients ──WS /v1/ingest──▶ raw log: raw_exchanges + raw_frames (append
 
 **Tool calls.** Each tool call the model makes is linked to the first later request of the same operation and session that carries its result, preferring one that resent the call with the same arguments (compared as canonical JSON). Apps resend arguments re-serialized and with defaults filled in, so an id only one tool call uses links to the nearest result regardless; an id several use (`functions.lookup:0` repeats across conversations, Gemini calls without id match by tool name) only links to results that resent the same arguments or none. Recorded per link: whether it errored, its size, and the gap between the call that requested it and the one that carried the result.
 
-## The canonical record## The canonical record
+## The canonical record
 
 HTTP, SSE and WebSocket share one shape: an exchange is an ordered list of timestamped frames, plus the context that isn't on the wire.
 
@@ -90,6 +90,12 @@ Per-frame times replace a single TTFT number. Later processing derives:
 - stalls.
 
 ## TypeScript
+
+Install the client from the GitHub release; it pulls in `@traumfaenger/api` from the same release, no registry or token needed:
+
+```sh
+bun add @traumfaenger/client@https://github.com/traumventures/traumfaenger/releases/download/v0.1.0/traumfaenger-client-0.1.0.tgz
+```
 
 ```ts
 import { createDatabase } from "@traumfaenger/client";
@@ -257,7 +263,7 @@ TRAUMFAENGER_QUERY_TOKEN=$(openssl rand -hex 32) \
 cargo run --release -p traumfaenger-server
 ```
 
-Docker: `docker build -t traumfaenger .`. The image stores data in the `/data` volume and listens on `0.0.0.0:7600` and `0.0.0.0:7601`.
+Docker: `rg.fr-par.scw.cloud/traumventures/traumfaenger/traumfaenger:<version>`, or `docker build -t traumfaenger .`. The image stores data in the `/data` volume (owned by uid 10001) and listens on `0.0.0.0:7600` and `0.0.0.0:7601`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -298,6 +304,12 @@ TRAUMFAENGER_DATABASE=local.duckdb TRAUMFAENGER_AUTH=disabled cargo run --releas
 The replay report shows parse coverage by API, status and reason, how often each field is filled, contents and their deduplication, tool call linking, and cost per operation. `import` loads and processes 5,607 calls in a few seconds.
 
 Changing what processing produces means bumping `PARSER_VERSION` in `crates/process/src/lib.rs`; the server then reprocesses the raw log on start.
+
+## Release
+
+1. Set the new version in `Cargo.toml` (`[workspace.package]`) and in both `packages/*/package.json`; `cargo check` updates `Cargo.lock`.
+2. Merge, then tag `main`: `git tag v<version> && git push origin v<version>`.
+3. `.github/workflows/release.yml` pushes the server image to `rg.fr-par.scw.cloud/traumventures/traumfaenger/traumfaenger:<version>` and attaches `traumfaenger-api-<version>.tgz` and `traumfaenger-client-<version>.tgz` (packed by `scripts/pack-release.ts`) to the GitHub release. A published version is never replaced; fix forward with a new one.
 
 ## Develop
 
