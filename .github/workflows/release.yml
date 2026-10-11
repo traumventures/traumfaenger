@@ -26,6 +26,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Refuse a version that is already released
+        # A published version is never replaced, neither its image nor its
+        # tarballs. The release is created last, so it marks a complete run.
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists; publish a new version instead" >&2
+            exit 1
+          fi
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to the registry
@@ -60,8 +72,6 @@ jobs:
 
   packages:
     runs-on: blacksmith-4vcpu-ubuntu-2204
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -78,13 +88,27 @@ jobs:
           fi
           bun scripts/pack-release.ts "$tag" dist
 
-      - name: Publish the release
+      - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: tarballs
+          path: dist/*.tgz
+          retention-days: 1
+
+  release:
+    # Only after the image is in the registry: a release always has its image.
+    needs: [image, packages]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarballs
+          path: dist
+
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "release $GITHUB_REF_NAME exists; tarballs of a published version are never replaced" >&2
-            exit 1
-          fi
-          gh release create "$GITHUB_REF_NAME" dist/*.tgz --verify-tag --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tgz -R "$GITHUB_REPOSITORY" --verify-tag --generate-notes
