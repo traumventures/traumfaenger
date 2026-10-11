@@ -27,7 +27,7 @@ jobs:
       test: ""
 
   typescript-test:
-    runs-on: [self-hosted, traumventures]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60 # a cold server build (bundled DuckDB) alone takes ~20 min
     steps:
       - uses: actions/checkout@v4
@@ -49,7 +49,7 @@ jobs:
   pack:
     # Packs the npm tarballs against the version in the manifests, so a
     # version mismatch fails before anyone tags.
-    runs-on: [self-hosted, traumventures]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
