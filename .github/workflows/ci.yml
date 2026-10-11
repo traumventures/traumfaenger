@@ -1,25 +1,57 @@
-name: CI
+name: ci
 
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
-    # GitHub-hosted runners are blocked by the organisation's spending limit.
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+  rust:
+    # cargo test includes the check that packages/api/src/generated.ts
+    # matches the Rust types.
+    uses: traumventures/ci/.github/workflows/rust.yml@v1
+
+  typescript:
+    uses: traumventures/ci/.github/workflows/typescript.yml@v1
+    with:
+      # The client tests start the Rust server (cargo build); they run in
+      # typescript-test, which has both toolchains.
+      test: ""
+
+  typescript-test:
+    runs-on: [self-hosted, traumventures]
+    timeout-minutes: 60 # a cold server build (bundled DuckDB) alone takes ~20 min
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - uses: oven-sh/setup-bun@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      # Includes the check that packages/api/src/generated.ts matches the Rust types.
-      - run: cargo test --locked
       - run: bun install --frozen-lockfile
-      - run: bun run typecheck
+      # The tests build the server in a hook with a time limit; a cold build
+      # (bundled DuckDB) takes longer, so build it here first.
+      - run: cargo build --locked -p traumfaenger-server
       - run: bun run test
+
+  docker:
+    # Build check of the server image; release.yml publishes it.
+    uses: traumventures/ci/.github/workflows/docker.yml@v1
+    with:
+      image: traumfaenger
+
+  pack:
+    # Packs the npm tarballs against the version in the manifests, so a
+    # version mismatch fails before anyone tags.
+    runs-on: [self-hosted, traumventures]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun scripts/pack-release.ts "v$(jq -r .version packages/api/package.json)" dist

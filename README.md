@@ -309,7 +309,7 @@ Changing what processing produces means bumping `PARSER_VERSION` in `crates/proc
 
 1. Set the new version in `Cargo.toml` (`[workspace.package]`) and in both `packages/*/package.json`; `cargo check` updates `Cargo.lock`.
 2. Merge, then tag `main`: `git tag v<version> && git push origin v<version>`.
-3. `.github/workflows/release.yml` pushes the server image to `rg.fr-par.scw.cloud/traumventures/traumfaenger/traumfaenger:<version>` and attaches `traumfaenger-api-<version>.tgz` and `traumfaenger-client-<version>.tgz` (packed by `scripts/pack-release.ts`) to the GitHub release. A published version is never replaced; fix forward with a new one.
+3. `.github/workflows/release.yml` (on our own runners, building blocks from [traumventures/ci](https://github.com/traumventures/ci)) pushes the server image to `rg.fr-par.scw.cloud/traumventures/traumfaenger/traumfaenger:<version>` (and `:<commit sha>`) and attaches `traumfaenger-api-<version>.tgz` and `traumfaenger-client-<version>.tgz` (packed by `scripts/pack-release.ts`) to the GitHub release. A published version is never replaced; fix forward with a new one.
 
 ## Develop
 

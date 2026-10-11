@@ -1,95 +1,55 @@
-name: Release
+name: release
 
 # A tag v<version> publishes one release:
-#   - the server image rg.fr-par.scw.cloud/traumventures/traumfaenger/traumfaenger:<version>
+#   - the server image rg.fr-par.scw.cloud/traumventures/traumfaenger/traumfaenger
+#     as :<version> and :<commit sha>
 #   - @traumfaenger/api and @traumfaenger/client as tarballs on the GitHub
 #     release, installable from their URL without a registry or token.
-# Pull requests build both without publishing.
+# Pull requests build both in ci.yml without publishing.
 
 on:
   push:
     tags: ["v*"]
-  pull_request:
-    branches: [main]
 
 permissions:
   contents: read
 
-env:
-  # Scaleway Container Registry, namespace shared by traumventures products.
-  IMAGE: rg.fr-par.scw.cloud/traumventures/traumfaenger/traumfaenger
-
 jobs:
-  image:
-    # GitHub-hosted runners are blocked by the organisation's spending limit.
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+  guard:
+    # A published version is never replaced, neither its image nor its
+    # tarballs. The release is created last, so it marks a complete run.
+    runs-on: [self-hosted, traumventures]
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-
       - name: Refuse a version that is already released
-        # A published version is never replaced, neither its image nor its
-        # tarballs. The release is created last, so it marks a complete run.
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $GITHUB_REF_NAME exists; publish a new version instead" >&2
-            exit 1
-          fi
+          status=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")
+          case "$status" in
+            404) ;;
+            200) echo "release $GITHUB_REF_NAME exists; publish a new version instead" >&2; exit 1 ;;
+            *) echo "cannot check for release $GITHUB_REF_NAME (HTTP $status)" >&2; exit 1 ;;
+          esac
 
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to the registry
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: docker/login-action@v3
-        with:
-          registry: rg.fr-par.scw.cloud
-          username: nologin
-          password: ${{ secrets.SCW_REGISTRY_PUSH_KEY }}
-
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=sha
-
-      - name: Build and publish
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          # The production host is x86_64; arm64 under emulation would take an
-          # hour for the Rust build.
-          platforms: linux/amd64
-          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=traumfaenger
-          cache-to: type=gha,mode=max,scope=traumfaenger
+  image:
+    needs: guard
+    uses: traumventures/ci/.github/workflows/docker.yml@v1
+    with:
+      image: traumfaenger
+      push: true
+    secrets: inherit
 
   packages:
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    needs: guard
+    runs-on: [self-hosted, traumventures]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - uses: oven-sh/setup-bun@v2
-
-      - name: Pack
-        # Pull requests pack against the version in the manifests, so a version
-        # mismatch fails before anyone tags.
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            tag="$GITHUB_REF_NAME"
-          else
-            tag="v$(jq -r .version packages/api/package.json)"
-          fi
-          bun scripts/pack-release.ts "$tag" dist
-
+      - run: bun scripts/pack-release.ts "$GITHUB_REF_NAME" dist
       - uses: actions/upload-artifact@v4
-        if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: tarballs
           path: dist/*.tgz
@@ -98,8 +58,8 @@ jobs:
   release:
     # Only after the image is in the registry: a release always has its image.
     needs: [image, packages]
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: [self-hosted, traumventures]
+    timeout-minutes: 5
     permissions:
       contents: write
     steps:
@@ -107,8 +67,9 @@ jobs:
         with:
           name: tarballs
           path: dist
-
       - name: Publish the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.tgz -R "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tgz
+          fail_on_unmatched_files: true
+          generate_release_notes: true

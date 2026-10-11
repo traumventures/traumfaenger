@@ -10,7 +10,7 @@
 // Usage: bun scripts/pack-release.ts v0.1.0 [out-dir]
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 
 const PACKAGES = ["api", "client"] as const;
 const root = resolve(import.meta.dir, "..");
@@ -52,10 +52,10 @@ try {
     }
     manifest.repository = { type: "git", url: `git+https://github.com/${repository}.git`, directory: `packages/${name}` };
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 4)}\n`);
-    const pack = Bun.spawnSync(["npm", "pack", "--silent", "--pack-destination", outDir], { cwd: dir, stderr: "inherit" });
-    if (pack.exitCode !== 0) throw new Error(`npm pack failed for ${name}`);
-    const produced = pack.stdout.toString().trim();
-    if (produced !== tarball(name)) throw new Error(`npm pack wrote ${produced}, expected ${tarball(name)}`);
+    const pack = Bun.spawnSync(["bun", "pm", "pack", "--quiet", "--destination", outDir], { cwd: dir, stderr: "inherit" });
+    if (pack.exitCode !== 0) throw new Error(`bun pm pack failed for ${name}`);
+    const produced = basename(pack.stdout.toString().trim().split("\n").pop() ?? "");
+    if (produced !== tarball(name)) throw new Error(`bun pm pack wrote ${produced}, expected ${tarball(name)}`);
     console.log(join(outDir, produced));
   }
 } finally {
