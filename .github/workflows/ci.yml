@@ -35,6 +35,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+      # The tests build the server in a hook with a time limit; a cold build
+      # (bundled DuckDB) takes longer, so build it here first.
+      - run: cargo build --locked -p traumfaenger-server
       - run: bun run test
 
   docker:
