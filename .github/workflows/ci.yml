@@ -21,6 +21,21 @@ jobs:
 
   typescript:
     uses: traumventures/ci/.github/workflows/typescript.yml@v1
+    with:
+      # The client tests start the Rust server (cargo build); they run in
+      # typescript-test, which has both toolchains.
+      test: ""
+
+  typescript-test:
+    runs-on: [self-hosted, traumventures]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run test
 
   docker:
     # Build check of the server image; release.yml publishes it.
