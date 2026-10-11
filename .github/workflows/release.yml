@@ -18,7 +18,7 @@ jobs:
   guard:
     # A published version is never replaced, neither its image nor its
     # tarballs. The release is created last, so it marks a complete run.
-    runs-on: [self-hosted, traumventures]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - name: Refuse a version that is already released
@@ -43,7 +43,7 @@ jobs:
 
   packages:
     needs: guard
-    runs-on: [self-hosted, traumventures]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +60,7 @@ jobs:
   release:
     # Only after the image is in the registry: a release always has its image.
     needs: [image, packages]
-    runs-on: [self-hosted, traumventures]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     permissions:
       contents: write
