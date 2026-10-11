@@ -34,6 +34,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       # The tests build the server in a hook with a time limit; a cold build
       # (bundled DuckDB) takes longer, so build it here first.
@@ -54,4 +56,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
       - run: bun scripts/pack-release.ts "v$(jq -r .version packages/api/package.json)" dist
