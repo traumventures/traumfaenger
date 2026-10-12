@@ -13,9 +13,15 @@ on:
 
 permissions:
   contents: read
+  actions: read # gate: reads the ci result
 
 jobs:
+  # Only a commit of main whose ci passed is released (the tag may point anywhere).
+  gate:
+    uses: traumventures/ci/.github/workflows/gate.yml@v1
+
   guard:
+    needs: gate
     # A published version is never replaced, neither its image nor its
     # tarballs. The release is created last, so it marks a complete run.
     runs-on: blacksmith-4vcpu-ubuntu-2404
