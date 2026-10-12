@@ -2,16 +2,20 @@ name: ci
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read # traumventures/ci: the "already passed" lookup
 
+# Pull requests: a new push cancels the older run. main: every commit keeps
+# its own run and result (gates ask for exactly that commit).
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   rust:
@@ -27,6 +31,7 @@ jobs:
       test: ""
 
   typescript-test:
+    if: github.event.pull_request.draft != true
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60 # a cold server build (bundled DuckDB) alone takes ~20 min
     steps:
@@ -49,6 +54,7 @@ jobs:
       image: traumfaenger
 
   pack:
+    if: github.event.pull_request.draft != true
     # Packs the npm tarballs against the version in the manifests, so a
     # version mismatch fails before anyone tags.
     runs-on: blacksmith-4vcpu-ubuntu-2404
