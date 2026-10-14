@@ -35,12 +35,16 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60 # a cold server build (bundled DuckDB) alone takes ~20 min
     steps:
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: traumventures/ci/actions/rust-cache@v1
+        with:
+          key: server
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.3
+      - name: Bun install cache (sticky disk)
+        uses: traumventures/ci/actions/bun-cache@v1
       - run: bun install --frozen-lockfile
       # The tests build the server in a hook with a time limit; a cold build
       # (bundled DuckDB) takes longer, so build it here first.
@@ -60,7 +64,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.3
