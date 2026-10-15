@@ -13,15 +13,21 @@ on:
 
 permissions:
   contents: read
-  actions: read # gate: reads the ci result
+  actions: read # ci: the "already passed" lookup
 
 jobs:
   # Only a commit of main whose ci passed is released (the tag may point anywhere).
   gate:
     uses: traumventures/ci/.github/workflows/gate.yml@v1
+    with: { await-ci: false }
+
+  # ci.yml runs only on demand and here: this release runs it first.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
 
   guard:
-    needs: gate
+    needs: [gate, ci]
     # A published version is never replaced, neither its image nor its
     # tarballs. The release is created last, so it marks a complete run.
     runs-on: blacksmith-4vcpu-ubuntu-2404
