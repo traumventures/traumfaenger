@@ -1,11 +1,10 @@
 name: ci
 
+# On demand only: gh workflow run ci.yml --ref <branch>. Nothing runs by itself
+# on pull requests or pushes; the deploy/release workflow calls this first.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-  push:
-    branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
