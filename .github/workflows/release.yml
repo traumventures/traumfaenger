@@ -61,7 +61,7 @@ jobs:
       - uses: useblacksmith/checkout@v1
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: bun scripts/pack-release.ts "$GITHUB_REF_NAME" dist
       - uses: actions/upload-artifact@v4
         with:

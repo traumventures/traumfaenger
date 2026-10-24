@@ -41,7 +41,7 @@ jobs:
           key: server
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - name: Bun install cache (sticky disk)
         uses: traumventures/ci/actions/bun-cache@v1
       - run: bun install --frozen-lockfile
@@ -66,5 +66,5 @@ jobs:
       - uses: useblacksmith/checkout@v1
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: bun scripts/pack-release.ts "v$(jq -r .version packages/api/package.json)" dist
