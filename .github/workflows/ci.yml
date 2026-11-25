@@ -31,10 +31,10 @@ jobs:
 
   typescript-test:
     if: github.event.pull_request.draft != true
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 60 # a cold server build (bundled DuckDB) alone takes ~20 min
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: traumventures/ci/actions/rust-cache@v1
         with:
@@ -60,10 +60,10 @@ jobs:
     if: github.event.pull_request.draft != true
     # Packs the npm tarballs against the version in the manifests, so a
     # version mismatch fails before anyone tags.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
