@@ -30,7 +30,7 @@ jobs:
     needs: [gate, ci]
     # A published version is never replaced, neither its image nor its
     # tarballs. The release is created last, so it marks a complete run.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Refuse a version that is already released
@@ -55,10 +55,10 @@ jobs:
 
   packages:
     needs: guard
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
@@ -72,7 +72,7 @@ jobs:
   release:
     # Only after the image is in the registry: a release always has its image.
     needs: [image, packages]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: write
